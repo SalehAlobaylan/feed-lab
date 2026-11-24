@@ -1,16 +1,21 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
-import { ArrowUpRight, Clipboard, Search } from 'lucide-react'
+import {
+  Activity as ActivityIcon, AlertTriangle, ArrowUpRight, BookmarkCheck, CheckCircle2, Clipboard,
+  Clock, FileCode2, FileText, GitBranch, HelpCircle, LayoutDashboard, Play, Radio, RefreshCw, Search, ShieldCheck, XCircle,
+} from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { lab, owner, RequestError, type Scope } from '../lib/client'
-import type { Evidence, InspectionSnapshot } from '../lib/evidence'
+import type { CheckSettings, Evidence, InspectionSnapshot } from '../lib/evidence'
+import { evaluateEligibility } from '../lib/feed-audit'
 import { asset, belongs, comparisonFields, duration, fields, responseRow, rows, text, time, valueText, type Fields } from '../lib/inspection'
-import { consumption, consumptionThreshold, safeURL, validID, type Item, type Page } from '../lib/feed'
+import { consumption, consumptionThreshold, playback as resolvePlayback, safeURL, validID, type Item, type Page } from '../lib/feed'
 import { formatTranscriptTime, normalizeTranscript } from '../lib/transcript-model'
 import { PreviewImage, type Reader, type Surface } from './consumer-preview'
 import type { Progress } from './player'
 
 const tabs = ['Overview', 'Content', 'Journey', 'Activity', 'Evidence'] as const
 type Tab = typeof tabs[number]
+type Tone = 'success' | 'warning' | 'danger' | 'info' | 'neutral'
 type RecordEntry = (entry: Evidence) => void
 type ReadContext = { scope: Scope; item?: Item; record: RecordEntry }
 type EventTarget = { id: string; journey: string; actionId?: string; captureId?: string }
@@ -18,6 +23,26 @@ type Selection = { id: string; item?: Item; story?: boolean }
 type ActionGroup = { id: string; entries: Evidence[] }
 type Jump = (tab: Tab, entry?: string) => void
 const requestEntry = (entry: Evidence) => /^(GET|POST|DELETE) /.test(entry.label)
+
+function statusTone(value?: string): Tone {
+  if (!value) return 'neutral'
+  if (/\b(excluded|failed|error|omitted|not met|rejected)\b/i.test(value)) return 'danger'
+  if (/\b(unobserved|unavailable|not applicable|no observation)\b/i.test(value)) return 'neutral'
+  if (/\b(unverified|stale|expired|fallback|partial|disabled)\b/i.test(value)) return 'warning'
+  if (/\b(eligible|verified|observed|advanced|opened|accepted|independent|saved row|active|recorded|returned|success|passed)\b/i.test(value)) return 'success'
+  if (/\b(sent|skipped|inspect)\b/i.test(value)) return 'info'
+  return 'neutral'
+}
+
+function tabIcon(view: Tab) {
+  switch (view) {
+    case 'Overview': return <LayoutDashboard size={14} aria-hidden="true" />
+    case 'Content': return <FileText size={14} aria-hidden="true" />
+    case 'Journey': return <GitBranch size={14} aria-hidden="true" />
+    case 'Activity': return <ActivityIcon size={14} aria-hidden="true" />
+    case 'Evidence': return <FileCode2 size={14} aria-hidden="true" />
+  }
+}
 
 function capturedItem(page: Page | null, id: string) {
   for (const item of page?.items ?? []) {
@@ -184,15 +209,23 @@ export function Activity({ entries, mode, onVerify, locked, focus }: {
       <summary><strong>{label}</strong><span>{time(group.entries[0].at)}</span></summary>
       <div className="record-body">
         <dl className="inspector-facts">
-          <div><dt>Browser</dt><dd>{text(event.outcome) || browser?.label || 'No observation recorded'}</dd></div>
-          <div><dt>Request</dt><dd>{sent ? 'Sent' : mode === 'inspect' ? 'Skipped in Inspect' : 'No request recorded'}</dd></div>
-          <div><dt>CMS acceptance</dt><dd>{accepted || writeAccepted ? 'Accepted' : receipt && fields(receipt.detail).disabled ? 'Collection disabled' : sent ? 'Unverified' : 'Not applicable'}</dd></div>
-          <div><dt>Persistence</dt><dd>{confirmed || independent ? 'Independent readback' : saved ? 'Saved row returned by CMS' : sent ? 'Unverified' : 'Not applicable'}</dd></div>
-          <div><dt>Downstream effect</dt><dd>Unverified</dd></div>
+          {(() => {
+            const browserText = text(event.outcome) || browser?.label || 'No observation recorded'
+            const requestText = sent ? 'Sent' : mode === 'inspect' ? 'Skipped in Inspect' : 'No request recorded'
+            const acceptText = accepted || writeAccepted ? 'Accepted' : receipt && fields(receipt.detail).disabled ? 'Collection disabled' : sent ? 'Unverified' : 'Not applicable'
+            const persistText = confirmed || independent ? 'Independent readback' : saved ? 'Saved row returned by CMS' : sent ? 'Unverified' : 'Not applicable'
+            return <>
+              <div><dt>Browser</dt><dd><span className="status-badge" data-tone={statusTone(browserText)}>{browserText}</span></dd></div>
+              <div><dt>Request</dt><dd><span className="status-badge" data-tone={statusTone(requestText)}>{requestText}</span></dd></div>
+              <div><dt>CMS acceptance</dt><dd><span className="status-badge" data-tone={statusTone(acceptText)}>{acceptText}</span></dd></div>
+              <div><dt>Persistence</dt><dd><span className="status-badge" data-tone={statusTone(persistText)}>{persistText}</span></dd></div>
+              <div><dt>Downstream effect</dt><dd><span className="status-badge" data-tone="neutral">Unverified</span></dd></div>
+            </>
+          })()}
         </dl>
-        {onVerify && eventID && journey && accepted && observed && <button disabled={locked} onClick={() => onVerify({
+        {onVerify && eventID && journey && accepted && observed && <div className="inline"><button className="btn-subtle" disabled={locked} onClick={() => onVerify({
           id: eventID, journey, actionId: observed.actionId, captureId: observed.captureId,
-        }, observed)}>Verify exact event</button>}
+        }, observed)}><ShieldCheck size={14} aria-hidden="true" />Verify exact event</button></div>}
         <RequestRows entries={group.entries} focus={focus} />
       </div>
     </details>
@@ -249,9 +282,83 @@ function Fold({ label, children, initiallyOpen = false }: { label: string; child
 function Ranking({ context, path }: { context: ReadContext; path: string }) {
   const query = useRead(context, path, true, { section: 'ranking' })
   const ranking = fields(fields(query.data).data)
+  const raw = typeof ranking.raw_rank === 'number' ? ranking.raw_rank : undefined
+  const final = typeof ranking.final_rank === 'number' ? ranking.final_rank : undefined
+  const delta = raw !== undefined && final !== undefined ? raw - final : undefined
   return <>
     <ReadStatus query={query} />
-    {query.data != null && <p>Anonymous assembly · {time(text(ranking.as_of))} · Raw rank {valueText(ranking.raw_rank) ?? 'unavailable'} · Final rank {valueText(ranking.final_rank) ?? 'unavailable'}</p>}
+    {query.data != null && <div className="ranking-summary">
+      <p>Anonymous assembly · {time(text(ranking.as_of))} · Raw rank {valueText(ranking.raw_rank) ?? 'unavailable'} · Final rank {valueText(ranking.final_rank) ?? 'unavailable'}</p>
+      {delta !== undefined && <span className="status-badge" data-tone={delta > 0 ? 'success' : delta < 0 ? 'warning' : 'neutral'}>
+        {delta > 0 ? `Lifted +${delta}` : delta < 0 ? `Demoted ${delta}` : 'Unchanged rank'}
+      </span>}
+    </div>}
+  </>
+}
+
+function ChapterMap({ context, mediaParent, activeId, onOpen }: {
+  context: ReadContext; mediaParent: string; activeId: string; onOpen: (id: string) => void
+}) {
+  const path = '/admin/media-atomization/parents/' + mediaParent + '/journey/chapters'
+  const query = useInfiniteQuery({
+    queryKey: ['inspector', ...scopeKey(context.scope), context.item?.id, context.item?.capture?.id, path, undefined, 'cursor'],
+    initialPageParam: '',
+    retry: false, staleTime: 60_000, refetchOnWindowFocus: false,
+    queryFn: ({ signal, pageParam }) => readOwner(context, path, signal, pageParam ? { cursor: pageParam } : undefined),
+    getNextPageParam: (value, _pages, _pageParam, cursors) => {
+      const data = fields(fields(value).data)
+      const next = text(data.next_cursor ?? data.next)
+      return next && !cursors.includes(next) ? next : undefined
+    },
+  })
+  const all = query.data?.pages.flatMap(value => {
+    const root = fields(value)
+    const data = fields(root.data)
+    return rows(data.items ?? root.items ?? root.data)
+  }) ?? []
+  const maxEnd = Math.max(1, ...all.map(r => Number(r.end_ms) || 0))
+  return <>
+    <ReadStatus query={query} empty={!all.length ? 'No records available.' : undefined} />
+    {all.length > 0 && <div className="chapter-timeline" aria-label="Episode chapter timeline">
+      <div className="chapter-timeline-track">
+        {all.map((row, index) => {
+          const start = Math.max(0, Number(row.start_ms) || 0)
+          const end = Math.max(start, Number(row.end_ms) || start)
+          const spanSec = (end - start) / 1000
+          const left = (start / maxEnd) * 100
+          const width = Math.max(2, ((end - start) / maxEnd) * 100)
+          const childId = typeof row.child_id === 'string' && validID(row.child_id) ? row.child_id : undefined
+          const isCurrent = childId === activeId
+          const tooShort = spanSec > 0 && spanSec < 270
+          const label = `${text(row.title) || 'Chapter ' + (index + 1)} (${duration(start / 1000) ?? '0:00'}–${duration(end / 1000) ?? '0:00'})`
+          const segmentAria = `Chapter ${index + 1}: ${duration(start / 1000) ?? '0:00'}–${duration(end / 1000) ?? '0:00'}`
+          return <button key={text(row.id) ?? index} type="button" className="chapter-segment"
+            data-current={isCurrent || undefined} data-short={tooShort || undefined}
+            disabled={!childId} title={label} aria-label={segmentAria}
+            style={{ left: left + '%', width: width + '%' }}
+            onClick={() => childId && onOpen(childId)} />
+        })}
+      </div>
+      <div className="chapter-timeline-axis">
+        <span>0:00</span>
+        <span>{duration(maxEnd / 1000) ?? ''}</span>
+      </div>
+    </div>}
+    {all.length > 0 && <ul className="inspector-related">{all.map((row, index) => {
+      const spanSec = Math.max(0, ((Number(row.end_ms) || 0) - (Number(row.start_ms) || 0)) / 1000)
+      const isCurrent = typeof row.child_id === 'string' && row.child_id === activeId
+      return <li key={text(row.id) ?? index} data-current={isCurrent || undefined}>
+        {typeof row.child_id === 'string' && validID(row.child_id)
+          ? <button className="inspector-link" onClick={() => onOpen(row.child_id as string)} dir="auto">{text(row.title) || row.child_id}</button>
+          : <strong dir="auto">{text(row.title) || 'Planned chapter'}</strong>}
+        <small>
+          {duration(Number(row.start_ms) / 1000)}–{duration(Number(row.end_ms) / 1000)} · {text(row.state)}
+          {spanSec > 0 && spanSec < 270 && ' · Below 270s feed floor'}
+        </small>
+      </li>
+    })}</ul>}
+    {query.hasNextPage && <button disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>Load more</button>}
+    {query.error && <button onClick={() => void query.refetch()}>Retry</button>}
   </>
 }
 
@@ -267,12 +374,14 @@ function Journey({ context, summary, path, isNews, lineage, refresh, fetching }:
     if (!links.some(link => link.href === href || link.href.startsWith(href + '/') || link.href.startsWith(href + '?'))) links.push({ href, label })
   }
   return <>
-    <div className="inspector-section-head"><h3>Current CMS journey</h3><button onClick={refresh} disabled={fetching}>Refresh CMS</button></div>
+    <div className="inspector-section-head"><h3>Current CMS journey</h3><button className="btn-subtle" onClick={refresh} disabled={fetching}><RefreshCw size={13} aria-hidden="true" />Refresh CMS</button></div>
     {summary.as_of != null && <p className="hint">Checked {time(text(summary.as_of))}</p>}
     <ol className="journey-list">{Object.entries(keys).map(([key, label]) => {
       const stage = fields(summary[key])
-      return <li key={key} id={'journey-' + key}>
-        <div className="inspector-section-head"><strong>{label}</strong><span className="inspector-chip">{text(stage.status) ?? 'Unavailable'}</span></div>
+      const stageStatus = text(stage.status) ?? 'Unavailable'
+      const tone = statusTone(stageStatus)
+      return <li key={key} id={'journey-' + key} data-tone={tone}>
+        <div className="inspector-section-head"><strong>{label}</strong><span className="inspector-chip" data-tone={tone}>{stageStatus}</span></div>
         {typeof stage.detail === 'string' && <p dir="auto">{stage.detail.replaceAll('_', ' ')}</p>}
         <small className="hint">{[text(stage.owner), stage.observed_at && time(text(stage.observed_at))].filter(Boolean).join(' · ')}</small>
         {key === 'processing' && <>
@@ -288,8 +397,8 @@ function Journey({ context, summary, path, isNews, lineage, refresh, fetching }:
     })}</ol>
     {!isNews && <Fold label="Inspect current Pods ranking"><Ranking context={context} path={path + '/trace-evidence'} /></Fold>}
     {lineage}
-    {context.scope.health.console_url && <div className="inline">{links.map(({ href, label }) =>
-      <a key={href} href={context.scope.health.console_url + href} target="_blank" rel="noreferrer">{label} <ArrowUpRight size={12} /></a>
+    {context.scope.health.console_url && <div className="console-links">{links.map(({ href, label }) =>
+      <a key={href} href={context.scope.health.console_url + href} target="_blank" rel="noreferrer">{label} <ArrowUpRight size={13} aria-hidden="true" /></a>
     )}</div>}
   </>
 }
@@ -401,13 +510,7 @@ function Content({ context, item, admin, lineage, selectedStory, summaryType, re
     {!isNews && <Fold label="Transcript"><Transcript context={context} item={{ ...item, transcript_id: item.transcript_id ?? text(lineage.transcript_id) }}
       media={media} canSeek={follows && !!media.current} onPreview={onPreview} /></Fold>}
     {mediaParent && validID(mediaParent) && <Fold label={parent ? 'Sibling chapters' : 'Chapter list'}>
-      <PagedRows context={context} path={'/admin/media-atomization/parents/' + mediaParent + '/journey/chapters'} paging="cursor"
-        render={row => <div>
-          {typeof row.child_id === 'string' && validID(row.child_id)
-            ? <button className="inspector-link" onClick={() => onOpen(row.child_id as string)} dir="auto">{text(row.title) || row.child_id}</button>
-            : <strong dir="auto">{text(row.title) || 'Planned chapter'}</strong>}
-          <small>{duration(Number(row.start_ms) / 1000)}–{duration(Number(row.end_ms) / 1000)} · {text(row.state)}</small>
-        </div>} />
+      <ChapterMap context={context} mediaParent={mediaParent} activeId={item.id} onOpen={onOpen} />
     </Fold>}
     {isNews && selectedStory && <div className="inspector-block">
       <h3>Captured story</h3>
@@ -465,13 +568,18 @@ function LogReader({ context, requestId }: { context: ReadContext; requestId?: s
 }
 
 export function ItemInspector({ scope, ready, locked, item, page, surface, reader, evidence, trimmed, onEvidence,
-  progress, media, onSave, onPreview, onVerify, onView, onPlay, onConsumption, onPreferences, checks, openChecks }: {
+  progress, media, onSave, onPreview, onVerify, onView, onPlay, onConsumption, onPreferences, checks, openChecks,
+  filters, forceFallback, onToggleFallback, requestedTab }: {
   scope: Scope; ready: boolean; locked: boolean; item?: Item; page: Page | null; surface: Surface; reader: Reader | null
   evidence: Evidence[]; trimmed: boolean; onEvidence: RecordEntry; progress: Progress; media: RefObject<HTMLMediaElement | null>
   onSave: (inspection?: InspectionSnapshot, note?: string) => Promise<boolean>; onPreview: () => void
   onVerify: (target: EventTarget, item?: Item) => void
   onView?: () => void; onPlay?: () => void; onConsumption?: () => void; onPreferences?: () => void; checks: (following: boolean) => ReactNode
   openChecks?: boolean
+  filters?: Pick<CheckSettings, 'duration' | 'language' | 'windowName'>
+  forceFallback?: boolean
+  onToggleFallback?: () => void
+  requestedTab?: { tab: Tab; seq: number }
 }) {
   const [tab, setTab] = useState<Tab>('Overview')
   const [selected, setSelected] = useState<Selection>()
@@ -495,6 +603,9 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
   }, [selectionKey])
   useEffect(() => { if (openLookup) lookupInput.current?.focus() }, [openLookup])
   useEffect(() => { if (openChecks) setShowChecks(true) }, [openChecks])
+  useEffect(() => {
+    if (requestedTab) { setShowChecks(false); setTab(requestedTab.tab) }
+  }, [requestedTab])
   const id = active?.id ?? ''
   const omittedItem = selected && !active?.capture
     ? page?.omissions.find(entry => entry.itemId === selected.id || entry.storyId === selected.id) : undefined
@@ -583,27 +694,48 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
   const playbackTime = duration(progress.played) ?? '0:00'
   const threshold = consumptionThreshold(item?.duration_sec ?? 0)
   const remaining = threshold ? Math.max(0, threshold - Math.floor(progress.played)) : undefined
+  const progressPct = threshold ? Math.min(100, Math.round((progress.played / threshold) * 100)) : 0
   const requestId = scoped.find(entry => entry.requestId)?.requestId
+  const feedResponseText = active?.capture ? (storyView ? 'Story returned' : active.responseRow?.includes('.members[') ? 'Returned in story coverage' : 'Item returned') :
+    omittedItem ? 'Omitted from the preview' : page ? 'Outside the loaded pages' : 'No feed pages loaded'
+  const renderText = rendered ? 'Observed in this capture' : 'Unobserved'
+  const playbackOrReaderText = isNews ? (scoped.some(entry => entry.itemId === id && entry.label === 'Reader rendered') ? 'Article opened' : 'Unobserved')
+    : played ? 'Media clock advanced' : error ? 'Playback error observed' : 'Unobserved'
+  const eligibilityText = text(eligibility.status) ?? 'Unavailable'
   return <section className="evidence-column item-inspector" aria-label="Evidence">
     <header className="inspector-header">
-      <div className="inspector-section-head">
+      <div className="inspector-top-row">
         <span className="eyebrow">{follow ? 'Selected item' : 'Item lookup'}</span>
-        <button aria-expanded={openLookup} onClick={() => setOpenLookup(value => !value)} disabled={!ready}><Search size={14} /> Open by ID</button>
+        <div className="inspector-top-actions">
+          <button className="btn-subtle" aria-expanded={openLookup} onClick={() => setOpenLookup(value => !value)} disabled={!ready}>
+            <Search size={13} aria-hidden="true" />Open by ID
+          </button>
+          <button className="btn-subtle" aria-expanded={showChecks} onClick={() => setShowChecks(value => !value)}>
+            <Play size={13} aria-hidden="true" />Run checks
+          </button>
+          <button disabled={locked || !evidence.length} aria-expanded={saving} onClick={() => setSaving(value => !value)}>
+            <BookmarkCheck size={13} aria-hidden="true" />Save investigation
+          </button>
+        </div>
       </div>
       {openLookup && <form className="inspector-lookup" onSubmit={event => { event.preventDefault(); open(lookup.trim()) }}>
         <label>Content ID <input ref={lookupInput} value={lookup} onChange={event => setLookup(event.target.value)} placeholder="Paste a content UUID" /></label>
-        <button disabled={!validID(lookup.trim())}>Open item</button>
+        <button className="primary" disabled={!validID(lookup.trim())}>Open item</button>
       </form>}
       <div className="inspector-identity">
-        <div className="inspector-kind">{active ? itemType.replaceAll('_', ' ').toLowerCase() : 'Item inspector'}</div>
+        <div className="inspector-kind-row">
+          <div className="inspector-kind">{active ? itemType.replaceAll('_', ' ').toLowerCase() : 'Item inspector'}</div>
+        </div>
         <h2 dir="auto">{title}</h2>
         {active && <div className="inspector-identity-meta">
-          <span dir="auto">{active.source_name || text(cms.source_name) || text(fields(summary.source).owner) || 'Source unavailable'}</span>
-          {duration(active.duration_sec ?? cms.duration_sec) && <span>{duration(active.duration_sec ?? cms.duration_sec)}</span>}
+          <span className="meta-pill" dir="auto">{active.source_name || text(cms.source_name) || text(fields(summary.source).owner) || 'Source unavailable'}</span>
+          {duration(active.duration_sec ?? cms.duration_sec) && <span className="meta-pill"><Clock size={12} aria-hidden="true" />{duration(active.duration_sec ?? cms.duration_sec)}</span>}
           <CopyID key={id} id={id} />
         </div>}
-        {active?.parent_id && <button className="inspector-link" onClick={() => open(active.parent_id!)}>Inspect parent episode</button>}
-        {containingStory && <button className="inspector-link" onClick={() => open(containingStory.id, containingStory, true)}>Inspect containing story</button>}
+        {(active?.parent_id || containingStory) && <div className="inspector-links-row">
+          {active?.parent_id && <button className="inspector-link" onClick={() => open(active.parent_id!)}>Inspect parent episode</button>}
+          {containingStory && <button className="inspector-link" onClick={() => open(containingStory.id, containingStory, true)}>Inspect containing story</button>}
+        </div>}
         {reader && follow && reader.item.id !== page?.items.find(value => value.id === reader.item.id)?.id &&
           <span className="hint">Reading an article from the current News slide</span>}
         {!follow && <div className="inspector-context">
@@ -612,13 +744,11 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
         </div>}
       </div>
       <nav className="inspector-tabs" aria-label="Item inspector">{tabs.map(view =>
-        <button key={view} aria-pressed={tab === view && !showChecks} onClick={() => { setShowChecks(false); jump(view) }}>{view}</button>)}</nav>
+        <button key={view} aria-pressed={tab === view && !showChecks} onClick={() => { setShowChecks(false); jump(view) }}>
+          {tabIcon(view)}{view}{view === 'Overview' && findings.length > 0 && <span className="tab-dot" aria-hidden="true" />}
+        </button>)}</nav>
     </header>
     <div className="inspector-panel">
-      <div className="inspector-toolbar">
-        <button aria-expanded={showChecks} onClick={() => setShowChecks(value => !value)}>Run checks</button>
-        <button disabled={locked || !evidence.length} aria-expanded={saving} onClick={() => setSaving(value => !value)}>Save investigation</button>
-      </div>
       {saving && <form className="inspector-save" onSubmit={async event => {
         event.preventDefault()
         if (await onSave(snapshot, note.trim() || undefined)) { setSaving(false); setNote('') }
@@ -632,23 +762,58 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
           <div className="inspector-block">
             <h3>What needs attention</h3>
             {findings.length ? <ul className="findings">{findings.slice(0, 3).map(finding => <li key={finding.title}>
-              <span dir="auto">{finding.title}</span><button className="inspector-link" onClick={() => jump(finding.tab, finding.entry)}>View {finding.tab.toLowerCase()}</button>
-            </li>)}</ul> : <p className="hint">{active ? 'No findings recorded. Review the observed and unobserved checks below.' : 'Open a feed or look up a content ID.'}</p>}
+              <span dir="auto" className="inline-flex items-center gap-2"><AlertTriangle size={15} className="shrink-0 text-[var(--accent)]" aria-hidden="true" />{finding.title}</span>
+              <button className="inspector-link" onClick={() => jump(finding.tab, finding.entry)}>View {finding.tab.toLowerCase()}</button>
+            </li>)}</ul> : active ? <div className="all-clear-card">
+              <CheckCircle2 size={16} className="shrink-0" aria-hidden="true" />
+              <p>No findings recorded. Review the observed and unobserved checks below.</p>
+            </div> : <p className="hint">Open a feed or look up a content ID.</p>}
           </div>
           {active && <div className="inspector-block">
             <h3>Consumer experience</h3>
-            <dl className="inspector-facts">
-              <div><dt>Feed response</dt><dd>{active.capture ? (storyView ? 'Story returned' : active.responseRow?.includes('.members[') ? 'Returned in story coverage' : 'Item returned') :
-                omittedItem ? <>Omitted from the preview · <code>{omittedItem.row}</code> {omittedItem.reason}</> :
-                page ? 'Outside the loaded pages' : 'No feed pages loaded'}</dd></div>
-              <div><dt>Preview render</dt><dd>{rendered ? 'Observed in this capture' : 'Unobserved'}</dd></div>
-              <div><dt>{isNews ? 'Article reader' : 'Playback'}</dt><dd>{isNews ? scoped.some(entry => entry.itemId === id && entry.label === 'Reader rendered') ? 'Article opened' : 'Unobserved'
-                : played ? 'Media clock advanced' : error ? 'Playback error observed' : 'Unobserved'}</dd></div>
-              <div><dt>Current CMS eligibility</dt><dd>{text(eligibility.status) ?? 'Unavailable'}</dd></div>
+            <dl className="experience-grid">
+              <div className="experience-card">
+                <dt>Feed response</dt>
+                <dd>
+                  {omittedItem ? <><span className="status-badge" data-tone="danger">Omitted from the preview</span> <code>{omittedItem.row}</code> {omittedItem.reason}</> :
+                    <span className="status-badge" data-tone={statusTone(feedResponseText)}>{feedResponseText}</span>}
+                </dd>
+              </div>
+              <div className="experience-card">
+                <dt>Preview render</dt>
+                <dd><span className="status-badge" data-tone={statusTone(renderText)}>{renderText}</span></dd>
+              </div>
+              <div className="experience-card">
+                <dt>{isNews ? 'Article reader' : 'Playback'}</dt>
+                <dd><span className="status-badge" data-tone={statusTone(playbackOrReaderText)}>{playbackOrReaderText}</span></dd>
+              </div>
+              <div className="experience-card">
+                <dt>Current CMS eligibility</dt>
+                <dd><span className="status-badge" data-tone={statusTone(eligibilityText)}>{eligibilityText}</span></dd>
+              </div>
             </dl>
             <ReadStatus query={summaryRead} />
             {summary.as_of != null && <p className="hint">Current CMS checked {time(text(summary.as_of))}</p>}
             {!follow && <ReadStatus query={cmsRead} />}
+            {!active.capture && <div className="eligibility-checklist" aria-label="Why item is outside loaded pages">
+              <h4>Eligibility gate check</h4>
+              <ul>
+                {evaluateEligibility({
+                  item: active, cms, summary, surface,
+                  filters: filters ?? { duration: '', language: '', windowName: 'today' },
+                  isNews,
+                }).map(gate => <li key={gate.id} data-gate={gate.status}>
+                  {gate.status === 'pass' ? <CheckCircle2 size={14} aria-hidden="true" /> :
+                    gate.status === 'fail' ? <XCircle size={14} aria-hidden="true" /> :
+                      gate.status === 'warning' ? <AlertTriangle size={14} aria-hidden="true" /> :
+                        <HelpCircle size={14} aria-hidden="true" />}
+                  <div>
+                    <strong>{gate.label}</strong>
+                    <p>{gate.detail}</p>
+                  </div>
+                </li>)}
+              </ul>
+            </div>}
             <CaptureScope capture={context.item?.capture} />
           </div>}
         </>}
@@ -674,12 +839,29 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
           <p className="hint">{scope.mode === 'inspect' ? 'Inspect keeps consumer activity local.' : 'Test as user can write consumer activity.'}</p>
           <div className="inline">
             {follow && onView && <button disabled={locked} onClick={onView}>{scope.mode === 'test' ? 'Send view' : 'Observe view'}</button>}
-            {follow && onPlay && <button disabled={locked} onClick={onPlay}>Measure playback</button>}
+            {follow && onPlay && <button className="primary" disabled={locked} onClick={onPlay}><Play size={13} aria-hidden="true" />Measure playback</button>}
             {follow && onConsumption && <button disabled={locked || !consumption(progress.played, progress.furthest, item?.duration_sec ?? 0)}
               onClick={onConsumption}>Check consumption</button>}
-            {onPreferences && <button disabled={locked} onClick={onPreferences}>Read preferences</button>}
+            {follow && onToggleFallback && item && Boolean(resolvePlayback(item, true).url) && <button type="button" className="btn-subtle"
+              aria-pressed={Boolean(forceFallback)} disabled={locked} onClick={onToggleFallback}>
+              <Radio size={13} aria-hidden="true" />Simulate fallback
+            </button>}
+            {onPreferences && <button className="btn-subtle" disabled={locked} onClick={onPreferences}>Read preferences</button>}
           </div>
-          {follow && onPlay && <p className="hint">{playbackTime} measured{remaining !== undefined && (remaining ? ' · ' + remaining + 's to qualify' : ' · Qualifying playback reached')}</p>}
+          {follow && onPlay && <div className="playback-meter">
+            <p className="hint">{playbackTime} measured{remaining !== undefined && (remaining ? ' · ' + remaining + 's to qualify' : ' · Qualifying playback reached')}</p>
+            {threshold > 0 && <div className="playback-meter-track" aria-hidden="true">
+              <div className="playback-meter-fill" data-qualified={remaining === 0 || undefined} style={{ width: progressPct + '%' }} />
+            </div>}
+            <div className="telemetry-strip" aria-label="Playback telemetry">
+              <span className="meta-pill">Format: {progress.type.toUpperCase()}{progress.fallback ? ' (fallback)' : ''}</span>
+              {progress.ttffMs !== undefined && <span className="meta-pill">TTFF: {progress.ttffMs} ms</span>}
+              {progress.hlsLevel && <span className="meta-pill">HLS: {progress.hlsLevel}</span>}
+              {progress.bufferedSec !== undefined && <span className="meta-pill">Buffer: {progress.bufferedSec}s</span>}
+              {progress.fragLatencyMs !== undefined && <span className="meta-pill">Frag: {progress.fragLatencyMs} ms</span>}
+              <span className="meta-pill">Stalls: {progress.stalls ?? 0}</span>
+            </div>
+          </div>}
           <Activity entries={visible} mode={scope.mode} onVerify={verify} locked={locked} focus={focus} />
         </>}
         {tab === 'Evidence' && <>
@@ -693,10 +875,10 @@ export function ItemInspector({ scope, ready, locked, item, page, surface, reade
             <ReadStatus query={cmsRead} />
             <ReadStatus query={deliveryRead} />
             <div className="inline">
-              <button disabled={!enabled || cmsRead.isFetching || deliveryRead.isFetching} onClick={() => {
+              <button className="btn-subtle" disabled={!enabled || cmsRead.isFetching || deliveryRead.isFetching} onClick={() => {
                 void cmsRead.refetch()
                 if (!isNews && activeType) void deliveryRead.refetch()
-              }}>Refresh CMS fields</button>
+              }}><RefreshCw size={13} aria-hidden="true" />Refresh CMS fields</button>
               {cmsRead.dataUpdatedAt > 0 && <small className="hint">CMS read {time(new Date(cmsRead.dataUpdatedAt).toISOString())}</small>}
             </div>
             <FieldComparison columns={[

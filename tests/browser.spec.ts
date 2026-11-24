@@ -20,6 +20,11 @@ const parent = '88888888-8888-4888-8888-888888888888'
 const missing = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const legacy = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const nestedArticle = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const topicTech = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+const topicScience = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+const declaredTopics = new Set<string>([topicTech])
+const mutedTopics = new Set<string>()
+let historyItems = [{ id: first, content_item_id: first, title: 'First episode', source_name: 'Fixture publisher', viewed_at: '2026-11-11T10:00:00Z' }]
 const calls: { path: string; auth?: string; consumer?: string; session: string | null }[] = []
 const states = new Set<string>()
 const events: unknown[] = []
@@ -202,6 +207,33 @@ test.beforeAll(async () => {
         id, type: id === parent || id === first || id === second ? 'PODCAST' : 'NEWS',
         title: id === parent ? 'Original parent episode' : 'Current CMS title', duration_sec: 272,
       })
+    }
+    if (path === '/api/v1/topics/picker') return result({
+      categories: [{ slug: 'general', label_en: 'General', label_ar: 'عام' }],
+      topics: [
+        { public_id: topicTech, slug: 'tech', label_en: 'Technology', label_ar: 'تقنية', category_slug: 'general' },
+        { public_id: topicScience, slug: 'science', label_en: 'Science', label_ar: 'علوم', category_slug: 'general' },
+      ],
+    })
+    if (path === '/api/v1/preferences') return result({
+      declared: [...declaredTopics].map(id => ({ id, slug: id === topicTech ? 'tech' : 'science', label_en: id === topicTech ? 'Technology' : 'Science', state: 'declared' })),
+      learned: mutedTopics.has(topicScience) || declaredTopics.has(topicScience) ? [] : [{ id: topicScience, slug: 'science', label_en: 'Science', score: 0.78 }],
+      muted: [...mutedTopics].map(id => ({ id, slug: 'science', label_en: 'Science', state: 'muted' })),
+      muted_sources: [],
+    })
+    if (path === '/api/v1/preferences/topics' && req.method === 'PUT') {
+      declaredTopics.clear()
+      for (const id of body.topic_ids ?? []) declaredTopics.add(id)
+      return result({ ok: true })
+    }
+    if (path === `/api/v1/preferences/topics/${topicScience}/mute`) {
+      if (req.method === 'POST') mutedTopics.add(topicScience)
+      else mutedTopics.delete(topicScience)
+      return result({ ok: true })
+    }
+    if (path === '/api/v1/interactions/history') {
+      if (req.method === 'DELETE') { historyItems = []; return result({ ok: true }) }
+      return result({ items: historyItems, cursor: null })
     }
     if (path.endsWith('/diagnostics')) return result({ content_item: { rendition_digest: 'current rendition', rendition_set_version: 3 } })
     if (path.startsWith('/admin/')) return result({ data: { diagnosis: 'fixture evidence' } })
@@ -467,6 +499,9 @@ test('consumer controls preserve the media and navigate related news at phone wi
   await expect(video).toHaveCSS('object-fit', 'cover')
   await phone.getByRole('button', { name: 'Fit', exact: true }).click()
   await expect(video).toHaveCSS('object-fit', 'contain')
+  const stage = phone.locator('.pod-stage')
+  await stage.hover()
+  await expect(stage).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
   await page.screenshot({ path: testInfo.outputPath('pods-video-fit.png') })
 
   await phone.getByRole('button', { name: 'الأخبار', exact: true }).click()
@@ -923,4 +958,78 @@ test('plays and reads from Saved and preserves a Pods card when recovery fails',
     failPods = false
     expirePodsPage = false
   }
+})
+
+test('studio tools audit feed health, inspect consumer profile, diff vs anonymous, and filter saved runs', async ({ page }, testInfo) => {
+  await page.goto(url)
+  await page.getByRole('button', { name: 'Quick Sign In' }).click()
+  const phone = page.getByLabel('Feed card', { exact: true })
+  const inspector = page.getByRole('region', { name: 'Evidence', exact: true })
+  await expect(phone.getByRole('heading', { name: 'First episode' })).toBeVisible()
+
+  // Feed Health drawer + multi-page batch loader
+  await page.getByRole('button', { name: 'Feed health' }).click()
+  const healthDrawer = page.getByRole('region', { name: 'Feed health audit' })
+  await expect(healthDrawer).toBeVisible()
+  await healthDrawer.getByRole('button', { name: 'Load up to 5 pages' }).click()
+  await expect(healthDrawer).toContainText('2 loaded items')
+  await page.screenshot({ path: testInfo.outputPath('feed-health-desktop.png') })
+  await healthDrawer.getByRole('button', { name: 'Close feed health' }).click()
+
+  // Eligibility gate checklist on detached parent lookup + chapter timeline
+  await inspector.getByRole('button', { name: 'Open by ID' }).click()
+  await inspector.getByLabel('Content ID', { exact: true }).fill(parent)
+  await inspector.getByRole('button', { name: 'Open item' }).click()
+  await expect(inspector.getByLabel('Why item is outside loaded pages')).toBeVisible()
+  await inspector.getByRole('button', { name: 'Content', exact: true }).click()
+  await inspector.getByText('Chapter list', { exact: true }).click()
+  await expect(inspector.getByLabel('Episode chapter timeline')).toBeVisible()
+  await inspector.getByRole('button', { name: 'Return to preview item' }).click()
+
+  // Simulate fallback & playback telemetry strip on item with fallback
+  await inspector.getByRole('button', { name: 'Activity', exact: true }).click()
+  await expect(inspector.getByLabel('Playback telemetry')).toBeVisible()
+  await inspector.getByRole('button', { name: 'Simulate fallback' }).click()
+  await expect(phone.locator('audio')).toHaveAttribute('data-playback-fallback', 'true')
+
+  // Multi-page contract audit scenario
+  await inspector.getByRole('button', { name: 'Run checks', exact: true }).click()
+  await inspector.getByLabel('Scenario', { exact: true }).selectOption('audit')
+  await inspector.getByRole('button', { name: 'Run scenario' }).click()
+  await expect(page.locator('.notice')).toContainText('Scenario passed', { timeout: 20000 })
+
+  // Consumer Profile sandbox & Diff vs Anonymous
+  await page.getByLabel('Consumer', { exact: true }).selectOption('signed')
+  await page.getByRole('button', { name: 'Quick Sign In' }).click()
+  await expect(phone.getByRole('heading', { name: 'First episode' })).toBeVisible()
+  await page.getByRole('button', { name: 'Diff vs Anonymous' }).click()
+  await expect(page.getByRole('region', { name: 'Feed comparison' })).toBeVisible()
+  await page.getByRole('button', { name: 'Clear baseline' }).click()
+
+  await page.getByRole('button', { name: 'Consumer profile', exact: true }).click()
+  const profileDrawer = page.getByRole('region', { name: 'Consumer profile and preferences' })
+  await expect(profileDrawer).toContainText('Technology')
+  await expect(profileDrawer).toContainText('Science')
+  await expect(profileDrawer.getByRole('button', { name: /Science/ })).toBeDisabled()
+  await page.getByRole('button', { name: 'Test as user', exact: true }).click()
+  await page.getByRole('button', { name: 'Pods', exact: true }).click()
+  await expect(phone.getByRole('heading', { name: 'First episode' })).toBeVisible()
+  await profileDrawer.getByRole('button', { name: /Science/ }).click()
+  await expect(profileDrawer.locator('.notice')).toContainText('Updated declared topics')
+  await profileDrawer.getByRole('button', { name: 'Clear history' }).click()
+  await expect(profileDrawer.locator('.notice')).toContainText('Watch history cleared')
+  await page.screenshot({ path: testInfo.outputPath('consumer-profile-desktop.png') })
+  await profileDrawer.getByRole('button', { name: 'Close consumer profile' }).click()
+
+  // Keyboard shortcuts modal
+  await page.keyboard.press('?')
+  await expect(page.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { name: 'Keyboard shortcuts' })).toHaveCount(0)
+
+  // Saved runs search & verdict filter
+  await page.getByRole('link', { name: 'Saved runs' }).click()
+  await expect(page.getByLabel('Search saved runs')).toBeVisible()
+  await page.getByRole('group', { name: 'Verdict filter' }).getByRole('button', { name: 'passed' }).click()
+  await expect(page.getByText('Feed contract audit (multi-page)').first()).toBeVisible()
 })

@@ -22,7 +22,7 @@
   touch-action: pan-y;
 }
 .phone :focus-visible { outline-color: #fff; }
-.phone button { padding: 0; border: 0; border-radius: 0; background: none; color: inherit; }
+.phone button { padding: 0; border: 0; border-radius: 0; background: none; color: inherit; box-shadow: none; transform: none; }
 .phone button:disabled { opacity: .55; }
 .phone svg { flex-shrink: 0; width: 18px; height: 18px; }
 .phone img { display: block; width: 100%; height: 100%; object-fit: cover; }

@@ -41,6 +41,21 @@ function Position({ row }: { row?: FeedRow & { position: number } }) {
   </details>
 }
 
+function diffTone(label: string) {
+  if (label === 'Same captured row') return 'neutral'
+  if (/only observed in baseline/i.test(label)) return 'danger'
+  if (/only observed in current/i.test(label)) return 'info'
+  return 'warning'
+}
+
+function rankDelta(before?: FeedRow & { position: number }, after?: FeedRow & { position: number }) {
+  if (!before && after) return { label: 'NEW', tone: 'info' }
+  if (before && !after) return { label: 'OUT', tone: 'danger' }
+  if (!before || !after || before.position === after.position) return undefined
+  const diff = before.position - after.position
+  return { label: diff > 0 ? `+${diff}` : String(diff), tone: diff > 0 ? 'success' : 'warning' }
+}
+
 export function FeedComparisonView({ comparison, evidence }: { comparison: FeedComparison; evidence: Evidence[] }) {
   const [changesOnly, setChangesOnly] = useState(true)
   const { baseline, current } = comparison
@@ -60,8 +75,12 @@ export function FeedComparisonView({ comparison, evidence }: { comparison: FeedC
       <table className="inspector-table"><thead><tr><th scope="col">Item</th><th scope="col">Baseline</th><th scope="col">Current</th><th scope="col">Result</th></tr></thead>
         <tbody>{visible.map(row => {
           const item = row.after ?? row.before!
-          return <tr key={row.key}><th scope="row" dir="auto">{item.title || item.itemId}</th>
-            <td><Position row={row.before} /></td><td><Position row={row.after} /></td><td>{feedDifferenceLabel(row)}</td></tr>
+          const label = feedDifferenceLabel(row)
+          const delta = rankDelta(row.before, row.after)
+          return <tr key={row.key} data-changed={label !== 'Same captured row' || undefined}><th scope="row" dir="auto">{item.title || item.itemId}</th>
+            <td><Position row={row.before} /></td>
+            <td><div className="inline-flex items-center gap-1.5 flex-wrap"><Position row={row.after} />{delta && <span className="status-badge" data-tone={delta.tone}>{delta.label}</span>}</div></td>
+            <td><span className="status-badge" data-tone={diffTone(label)}>{label}</span></td></tr>
         })}</tbody>
       </table>
     </div> : <p className="hint">{changesOnly ? 'No changed rows in the captured pages.' : 'No rows in either capture.'}</p>}

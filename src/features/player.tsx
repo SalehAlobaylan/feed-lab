@@ -6,7 +6,19 @@ import { sceneRecipe, SCENE_PALETTES } from '../lib/scene-generator'
 import { activeTranscriptCueIndex, formatTranscriptTime, type TranscriptPresentation } from '../lib/transcript-model'
 import { ItemActions, PreviewImage, PreviewSheet, textLanguage, type Interaction } from './consumer-preview'
 
-export interface Progress { played: number; furthest: number; started: boolean; fallback: boolean; error?: string; type: 'hls' | 'mp4' | 'audio' }
+export interface Progress {
+  played: number
+  furthest: number
+  started: boolean
+  fallback: boolean
+  error?: string
+  type: 'hls' | 'mp4' | 'audio'
+  ttffMs?: number
+  hlsLevel?: string
+  bufferedSec?: number
+  stalls?: number
+  fragLatencyMs?: number
+}
 type Display = 'listen' | 'transcript' | 'fit' | 'fill'
 type TranscriptState = { status: 'loading' | 'failed' } | { status: 'ready'; data: TranscriptPresentation }
 const rates = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
@@ -30,7 +42,7 @@ function AudioScene({ item, playing }: { item: Item; playing: boolean }) {
   </div>
 }
 
-export function Player({ item, media, report, observed, disabled, writesDisabled, display, onDisplay, onInteraction, readTranscript }: {
+export function Player({ item, media, report, observed, disabled, writesDisabled, display, onDisplay, onInteraction, readTranscript, forceFallback = false }: {
   item: Item
   media: React.RefObject<HTMLMediaElement | null>
   report: (label: string, detail: unknown) => void
@@ -41,6 +53,7 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
   onDisplay: (audio: boolean, display: Display) => void
   onInteraction: (item: Item, kind: Interaction) => void
   readTranscript: (id: string, signal: AbortSignal) => Promise<TranscriptPresentation>
+  forceFallback?: boolean
 }) {
   const [fallback, setFallback] = useState(false)
   const [playing, setPlaying] = useState(false)
@@ -53,11 +66,13 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
   const [transcript, setTranscript] = useState<TranscriptState>()
   const [transcriptAttempt, setTranscriptAttempt] = useState(0)
   const { id } = item
-  const { url, type, audio } = playback(item, fallback)
   const { url: fallbackURL, type: fallbackType } = playback(item, true)
+  const effectiveFallback = fallback || (forceFallback && Boolean(fallbackURL))
+  const { url, type, audio } = playback(item, effectiveFallback)
   const callbacks = useRef({ report, observed, readTranscript })
   callbacks.current = { report, observed, readTranscript }
-  const progress = useRef<Progress>({ played: 0, furthest: 0, started: false, fallback: false, type })
+  const progress = useRef<Progress>({ played: 0, furthest: 0, started: false, fallback: effectiveFallback, type, stalls: 0 })
+  const attachTime = useRef<number>(performance.now())
   const prior = useRef<{ seconds: number; wall: number } | null>(null)
   const resume = useRef({ seconds: 0, playing: false })
   const card = useRef<HTMLDivElement>(null)
@@ -92,7 +107,7 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
     const failed = () => {
       if (handled) return
       handled = true
-      if (!fallback && fallbackURL && fallbackURL !== url) {
+      if (!effectiveFallback && fallbackURL && fallbackURL !== url) {
         resume.current = { seconds: el.currentTime, playing: !el.paused }
         callbacks.current.report('Playback fallback', { item: id, from: type, to: fallbackType })
         setFallback(true)
@@ -102,25 +117,41 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
         callbacks.current.report('Playback error', { item: id, type, code: el.error?.code })
       }
     }
-    progress.current = { ...progress.current, fallback, type }
+    attachTime.current = performance.now()
+    progress.current = { ...progress.current, fallback: effectiveFallback, type, ttffMs: undefined, hlsLevel: undefined, fragLatencyMs: undefined }
     prior.current = null
     const loaded = () => {
       if (Number.isFinite(el.duration) && el.duration > 0) {
         setDuration(el.duration)
-        callbacks.current.report('Playback metadata observed', { item: id, duration: el.duration, type, fallback, url })
+        callbacks.current.report('Playback metadata observed', { item: id, duration: el.duration, type, fallback: effectiveFallback, url })
       }
-      if (fallback && resume.current.seconds) el.currentTime = Math.min(resume.current.seconds, el.duration || resume.current.seconds)
-      if (fallback && resume.current.playing) void el.play().catch(() => callbacks.current.report('Playback needs a gesture', { item: id }))
+      if (effectiveFallback && resume.current.seconds) el.currentTime = Math.min(resume.current.seconds, el.duration || resume.current.seconds)
+      if (effectiveFallback && resume.current.playing) void el.play().catch(() => callbacks.current.report('Playback needs a gesture', { item: id }))
     }
     el.addEventListener('error', failed)
     el.addEventListener('loadedmetadata', loaded)
     if (type === 'hls' && !el.canPlayType('application/vnd.apple.mpegurl') && Hls.isSupported()) {
       hls = new Hls()
       hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) failed() })
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+        const level = hls?.levels[data.level]
+        if (!level) return
+        const kbps = level.bitrate ? Math.round(level.bitrate / 1000) : undefined
+        const label = [level.height ? level.height + 'p' : 'Audio', kbps ? (kbps >= 1000 ? (kbps / 1000).toFixed(1) + ' Mbps' : kbps + ' kbps') : undefined].filter(Boolean).join(' · ')
+        progress.current.hlsLevel = label || undefined
+        callbacks.current.observed({ ...progress.current })
+      })
+      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+        const stats = data.frag?.stats?.loading
+        if (stats && typeof stats.end === 'number' && typeof stats.start === 'number') {
+          progress.current.fragLatencyMs = Math.max(0, Math.round(stats.end - stats.start))
+          callbacks.current.observed({ ...progress.current })
+        }
+      })
       hls.loadSource(url)
       hls.attachMedia(el)
     } else el.src = url
-    callbacks.current.report('Playback source selected', { item: id, url, type, audio, fallback })
+    callbacks.current.report(forceFallback && effectiveFallback ? 'Simulated primary fallback' : 'Playback source selected', { item: id, url, type, audio, fallback: effectiveFallback })
     return () => {
       el.removeEventListener('error', failed)
       el.removeEventListener('loadedmetadata', loaded)
@@ -129,7 +160,7 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
       el.removeAttribute('src')
       el.load()
     }
-  }, [audio, fallback, fallbackType, fallbackURL, id, media, type, url])
+  }, [audio, effectiveFallback, fallbackType, fallbackURL, forceFallback, id, media, type, url])
   useEffect(() => {
     if (!card.current || !url) return
     let attempted = false
@@ -154,9 +185,20 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
     return () => document.removeEventListener('visibilitychange', pause)
   }, [media])
   const reset = () => { prior.current = null }
+  const bufferedAhead = (el: HTMLMediaElement) => {
+    for (let i = 0; i < el.buffered.length; i++) {
+      if (el.currentTime >= el.buffered.start(i) - 0.5 && el.currentTime <= el.buffered.end(i)) {
+        return Math.max(0, Math.round((el.buffered.end(i) - el.currentTime) * 10) / 10)
+      }
+    }
+    return 0
+  }
   const update = () => {
     const el = media.current
-    if (el) setPosition(el.currentTime)
+    if (el) {
+      setPosition(el.currentTime)
+      progress.current.bufferedSec = bufferedAhead(el)
+    }
     if (!el || el.paused || el.seeking || scrubbing.current || document.hidden || el.readyState < 2) { reset(); return }
     const now = performance.now()
     const previous = prior.current
@@ -170,14 +212,29 @@ export function Player({ item, media, report, observed, disabled, writesDisabled
     state.furthest = Math.max(state.furthest, el.currentTime)
     if (!state.started && state.played >= 0.25) {
       state.started = true
+      if (state.ttffMs === undefined) state.ttffMs = Math.max(0, Math.round(now - attachTime.current))
       callbacks.current.report('Playback clock advanced', { item: item.id, ...state })
     }
     callbacks.current.observed({ ...state })
   }
-  const waiting = () => { reset(); setBuffering(true); callbacks.current.report('Playback waiting', { item: id, type }) }
-  const events = { 'data-playback-fallback': String(fallback), onTimeUpdate: update, onSeeking: reset,
+  const waiting = () => {
+    reset()
+    setBuffering(true)
+    if (progress.current.started) {
+      progress.current.stalls = (progress.current.stalls ?? 0) + 1
+      callbacks.current.observed({ ...progress.current })
+    }
+    callbacks.current.report('Playback waiting', { item: id, type })
+  }
+  const events = { 'data-playback-fallback': String(effectiveFallback), onTimeUpdate: update, onSeeking: reset,
     onPause: () => { reset(); setPlaying(false); setBuffering(false) },
-    onPlaying: () => { setPlaying(true); setBuffering(false) }, onCanPlay: () => setBuffering(false),
+    onPlaying: () => {
+      if (progress.current.ttffMs === undefined) {
+        progress.current.ttffMs = Math.max(0, Math.round(performance.now() - attachTime.current))
+        callbacks.current.observed({ ...progress.current })
+      }
+      setPlaying(true); setBuffering(false)
+    }, onCanPlay: () => setBuffering(false),
     onEnded: () => setPlaying(false), onWaiting: waiting, onStalled: waiting,
     onRateChange: () => { reset(); setRate(media.current?.playbackRate ?? 1) } }
   const toggle = () => {

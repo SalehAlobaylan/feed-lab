@@ -183,7 +183,8 @@ export async function auth(request: Request) {
 
 const itemID = '[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 const feedPath = new RegExp(`^/feed/(?:news|pods(?:/sessions(?:/${itemID}(?:/freshness)?)?)?)$`)
-const readPath = new RegExp(`^/(?:content/${itemID}|transcripts/${itemID}|interactions/(?:likes|bookmarks|history)|preferences(?:/profile)?)$`)
+const readPath = new RegExp(`^/(?:content/${itemID}|transcripts/${itemID}|interactions/(?:likes|bookmarks|history)|preferences(?:/profile)?|topics/picker)$`)
+const prefMutePath = new RegExp(`^/preferences/topics/${itemID}/mute$`)
 const diagnosticPath = new RegExp(`^/admin/(?:content(?:/${itemID})?|stories/${itemID}|content-stages/items/${itemID}/trace(?:-summary|-evidence)?|media-atomization/parents/${itemID}/journey/chapters|media/delivery/content/${itemID}/diagnostics|media/circulation/source-runs/${itemID}/trace|experience/evidence/events)$`)
 const allowedQuery = new Set(['cursor', 'limit', 'duration', 'content_language', 'window', 'locale', 'sort', 'feed', 'content_id',
   'journey_id', 'release', 'event_type', 'start', 'end', 'client_platform', 'type', 'content_item_id'])
@@ -199,10 +200,15 @@ export async function ownerRequest(request: Request) {
   const diagnostic = diagnosticPath.test(target)
   const frozenStart = target === '/feed/pods/sessions' && method === 'POST'
   const interaction = target === '/interactions' && ['POST', 'DELETE'].includes(method)
+  const historyClear = target === '/interactions/history' && method === 'DELETE'
+  const prefTopics = target === '/preferences/topics' && method === 'PUT'
+  const prefMute = prefMutePath.test(target) && ['POST', 'DELETE'].includes(method)
+  const consumerWrite = interaction || historyClear || prefTopics || prefMute
   const telemetry = target === '/experience/events' && method === 'POST'
   const readable = method === 'GET' && (isFeed || diagnostic || readPath.test(target))
-  if (!readable && !frozenStart && !interaction && !telemetry) throw new LabError(404, 'This operation is unavailable in Feed Lab.')
-  if (!test && (interaction || telemetry)) throw new LabError(403, 'Switch to Test as user to send activity.')
+  if (!readable && !frozenStart && !consumerWrite && !telemetry) throw new LabError(404, 'This operation is unavailable in Feed Lab.')
+  if (!test && (consumerWrite || telemetry)) throw new LabError(403, 'Switch to Test as user to send activity.')
+  if ((prefTopics || prefMute) && !signed) throw new LabError(401, 'Sign in as a consumer to edit preferences.')
   if (!diagnostic && !uuid.test(session)) throw new LabError(400, 'Invalid consumer session.')
   const op = await operator(request)
   if (request.headers.get('x-feed-lab-operator-id') !== op.principal.user_id) {
@@ -276,6 +282,14 @@ export async function ownerRequest(request: Request) {
     })
     const key = request.headers.get('idempotency-key')
     if (key && uuid.test(key)) headers.set('Idempotency-Key', key)
+  }
+  if (prefTopics) {
+    const input = await readJSON(request, 8192)
+    if (!Array.isArray(input.topic_ids) || input.topic_ids.length > 50 ||
+        !input.topic_ids.every((value): value is string => typeof value === 'string' && uuid.test(value))) {
+      throw new LabError(400, 'Provide a valid list of topic IDs.')
+    }
+    body = JSON.stringify({ topic_ids: input.topic_ids })
   }
   if (telemetry) {
     const token = process.env.RUX_INGEST_TOKEN

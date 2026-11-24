@@ -1,12 +1,19 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { ChevronDown, Zap } from 'lucide-react'
+import {
+  AlertCircle, BarChart3, Bookmark, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronsRight,
+  Eye, FlaskConical, GitCompareArrows, Headphones, Keyboard, KeyRound, Newspaper, Pin, Play, RefreshCw,
+  SlidersHorizontal, Square, Trash2, UserCheck, X, Zap,
+} from 'lucide-react'
 import { useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react'
 import { health, lab, owner, RequestError, type Health, type Identities, type Scope } from '../lib/client'
 import { fitRunEvidence, isFeedResponse, redact, type CheckResult, type CheckSettings, type Evidence, type FeedCapture, type FeedSnapshot, type InspectionSnapshot, type RunDraft, type SavedRun, type Verdict } from '../lib/evidence'
 import { adapt, consumption, playback, validID, type Item, type Page } from '../lib/feed'
+import { auditFeed } from '../lib/feed-audit'
 import { belongs, comparisonFields, responseRow } from '../lib/inspection'
 import { ArticleReader, FeedHeader, NewsPreview, SavedLibrary, type Interaction, type Reader, type Surface } from './consumer-preview'
+import { ConsumerProfilePanel } from './consumer-profile'
+import { FeedHealthPanel } from './feed-health'
 import { Player, type Progress } from './player'
 import { ItemInspector, transcriptQuery } from './item-inspector'
 import { Check, requireCheck, scenarios, type Scenario } from './scenarios'
@@ -101,7 +108,10 @@ function SignIn({ config, identities, onChange, locked, promptConsumer, busy, on
     } catch (error) { setProblem(errorText(error)) } finally { onBusy(false) }
   }
   return <details ref={panel} className="identity" open={identities.operator.state !== 'signed-in' || undefined}>
-    <summary ref={summary}><span>IAM identities</span><ChevronDown size={15} aria-hidden="true" /></summary>
+    <summary ref={summary}>
+      <span className="summary-label"><KeyRound size={14} aria-hidden="true" /><span>IAM identities</span></span>
+      <ChevronDown size={15} className="chevron" aria-hidden="true" />
+    </summary>
     <div className="identity-fields">
       <div className="identity-heading">
         <div><h2>{signedIn ? `${slot === 'operator' ? 'Operator' : 'Consumer'} session` : `Sign in as ${slot}`}</h2>
@@ -113,23 +123,23 @@ function SignIn({ config, identities, onChange, locked, promptConsumer, busy, on
       </div>
       {signedIn ? <div className="identity-current">
         <bdi>{state.email || 'Signed in'}</bdi>
-        <button disabled={locked} onClick={() => void submit('logout')}>Sign out {slot}</button>
+        <button className="btn-subtle" disabled={locked} onClick={() => void submit('logout')}>Sign out {slot}</button>
       </div> : <>
         {config.quickSignIn && <div className="identity-quick">
           <div><strong>Local account</strong><p className="hint">Uses the account configured for this launch.</p></div>
           <button ref={quickSignIn} className="primary quick-sign-in" disabled={locked}
             onClick={() => void submit('quick-sign-in')}><Zap size={16} aria-hidden="true" />Quick Sign In</button>
         </div>}
-        <form key={slot} className="inline" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void submit('login', new FormData(event.currentTarget)) }}>
-          {config.quickSignIn && <p className="identity-manual-label hint">Use email and password</p>}
+        <form key={slot} className="identity-form" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void submit('login', new FormData(event.currentTarget)) }}>
+          {config.quickSignIn && <p className="identity-manual-label">Use email and password</p>}
           <label>Email <input ref={email} name="email" type="email" autoComplete="username" required /></label>
           <label>Password <input name="password" type="password" autoComplete="current-password" required /></label>
           <button disabled={locked}>Sign in</button>
-          {state.state === 'expired' && <button type="button" disabled={locked} onClick={() => void submit('refresh')}>Refresh session</button>}
+          {state.state === 'expired' && <button type="button" className="btn-subtle" disabled={locked} onClick={() => void submit('refresh')}>Refresh session</button>}
         </form>
       </>}
       {busy && <p className="hint" role="status">Connecting to IAM…</p>}
-      {problem && <p className="problem" role="alert">{problem}</p>}
+      {problem && <p className="problem" role="alert"><AlertCircle size={15} aria-hidden="true" /><span>{problem}</span></p>}
     </div>
   </details>
 }
@@ -184,6 +194,14 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
   const [pin, setPin] = useState<{ operator: string; capture: FeedSnapshot; evidence: Evidence[] }>()
   const baseline = pin?.operator === identities.operator.id ? pin : undefined
   const [showComparison, setShowComparison] = useState(false)
+  const [showHealth, setShowHealth] = useState(false)
+  const [showProfile, setShowProfile] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [forceFallback, setForceFallback] = useState(false)
+  const [loadingBatch, setLoadingBatch] = useState(false)
+  const [requestedTab, setRequestedTab] = useState<{ tab: 'Overview' | 'Content' | 'Journey' | 'Activity' | 'Evidence'; seq: number }>()
+  const loadedDetailsRef = useRef<HTMLDetailsElement>(null)
+  const loadedSearchRef = useRef<HTMLInputElement>(null)
   const [comparisonNote, setComparisonNote] = useState('')
   const [loadedSearch, setLoadedSearch] = useState('')
   const [checkResults, setCheckResults] = useState<CheckResult[]>([])
@@ -284,6 +302,7 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
     observed.current = emptyProgress
     setProgress(emptyProgress)
     setReader(null)
+    setForceFallback(false)
   }, [current?.id, surface, mediaKey])
   useEffect(() => {
     setExpired(false)
@@ -788,6 +807,30 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
         const { page: loaded, index } = await feedSteps(scenario)
         if (scenario === 'news') await step('Open article', () => openReader(loaded.items[index], ctx), undefined, 'Reader opened')
         if (scenario === 'pods') await feedSteps('pods', true)
+      } else if (scenario === 'audit') {
+        const auditSurface = surface === 'news' ? 'news' : 'pods'
+        const first = await step('Load initial audit page', async () => {
+          const value = await load(auditSurface, ctx, undefined, false, settings)
+          requireCheck(!value.omitted.length, 'failed', 'The first page violated the preview contract.')
+          requireCheck(value.items.length, 'blocked', 'The environment returned no eligible items.')
+          return value
+        }, undefined, 'Page 1 loaded')
+        let collected = first
+        for (let pageIndex = 2; pageIndex <= 3 && collected.cursor; pageIndex++) {
+          collected = await step(`Load audit page ${pageIndex}`, async () => {
+            const value = await load(auditSurface, ctx, collected, false, settings)
+            requireCheck(!value.omitted.length, 'failed', `Page ${pageIndex} violated the item contract.`)
+            return value
+          }, undefined, `Page ${pageIndex} loaded`)
+        }
+        await step('Verify multi-page feed contract', async () => {
+          const summary = auditFeed(collected, auditSurface, entries)
+          requireCheck(summary.duplicateIds.length === 0, 'failed', `Found ${summary.duplicateIds.length} duplicate identities across loaded pages.`)
+          const badDurations = summary.flags.filter(flag => flag.code === 'duration_bounds')
+          requireCheck(badDurations.length === 0, 'failed', badDurations[0]?.detail ?? 'Duration bounds violated.')
+          const badMedia = summary.flags.filter(flag => flag.code === 'missing_playback')
+          requireCheck(badMedia.length === 0, 'failed', badMedia[0]?.detail ?? 'Missing playback source.')
+        }, undefined, 'Multi-page contract verified')
       } else if (scenario === 'playback' || scenario === 'consumption') {
         const target = repeat ? await repeatTarget() : { item: current, feedSession: page?.session_id }
         const item = target.item
@@ -920,6 +963,98 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
     setShowComparison(true)
     setComparisonNote('')
   }
+  async function loadBatchPages(maxPages = 5) {
+    if (!page?.cursor || controlsDisabled || loadingBatch || (surface === 'pods' && sessionEnded)) return
+    setLoadingBatch(true)
+    try {
+      await action(async ctx => {
+        let currentPage = page
+        let loaded = 0
+        while (currentPage.cursor && loaded < maxPages && !ctx.signal?.aborted) {
+          currentPage = await load(surface, ctx, currentPage)
+          loaded++
+        }
+        setNotice(`Loaded ${loaded} additional ${loaded === 1 ? 'page' : 'pages'} (${currentPage.items.length} total items).`)
+      })
+    } finally {
+      setLoadingBatch(false)
+    }
+  }
+  async function diffVsAnonymous() {
+    if (!signed || !activeSnapshot || !scope.operatorID || surface === 'saved' || controlsDisabled) return
+    await action(async ctx => {
+      const anonSession = crypto.randomUUID()
+      const anonScope: Scope = { ...scope, signed: false, consumerID: undefined, session: anonSession }
+      const ordinary = surface === 'pods' && page?.captures[0]?.query.contract === 'ordinary'
+      const query: Record<string, string> = { limit: '6' }
+      if (surface === 'pods' && duration) query.duration = duration
+      if (surface === 'pods' && language) query.content_language = language
+      if (surface === 'news') query.window = windowName
+      const path = surface === 'pods' ? (ordinary ? '/feed/pods' : '/feed/pods/sessions') : '/feed/news'
+      const method = surface === 'pods' && !ordinary ? 'POST' : undefined
+      const capture: FeedCapture = {
+        id: crypto.randomUUID(), at: now(), surface, mode,
+        consumer: 'Anonymous · ' + anonSession,
+        query: { ...query, ...(surface === 'pods' ? { contract: ordinary ? 'ordinary' : 'frozen' } : {}) },
+      }
+      const capturedEntries: Evidence[] = []
+      const anonCtx: RequestContext = {
+        signal: ctx.signal,
+        record: entry => {
+          const tagged = { ...entry, captureId: entry.captureId ?? capture.id }
+          capturedEntries.push(tagged)
+          ctx.record(tagged)
+        },
+      }
+      const raw = await owner<unknown>(anonScope, path, { method, query, signal: anonCtx.signal, record: anonCtx.record })
+      const payload = raw as { session_id?: unknown } | null
+      if (typeof payload?.session_id === 'string' && validID(payload.session_id) && path.startsWith('/feed/pods/sessions')) {
+        capture.session = payload.session_id
+      }
+      const anonPage = adapt(raw, surface, capture)
+      const anonSnapshot = feedSnapshot(anonPage, config, capturedEntries)
+      setPin({ operator: scope.operatorID!, capture: anonSnapshot, evidence: capturedEntries })
+      setShowComparison(true)
+      setComparisonNote('')
+      setNotice('Pinned Anonymous baseline for comparison.')
+    })
+  }
+  const feedAuditSummary = useMemo(() => auditFeed(page, surface, evidence), [page, surface, evidence])
+  const handleShortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return
+    const target = event.target as HTMLElement | null
+    if (target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)) return
+    if (event.key === 'Escape' && showShortcuts) { setShowShortcuts(false); return }
+    if (event.key === '?') { event.preventDefault(); setShowShortcuts(value => !value); return }
+    if (showShortcuts) return
+    if (event.key === 'j') { event.preventDefault(); move(1); return }
+    if (event.key === 'k') { event.preventDefault(); move(-1); return }
+    if (event.key === 'p' && activeSnapshot && !controlsDisabled) { event.preventDefault(); pinBaseline(); return }
+    if (event.key === 'h' && page) { event.preventDefault(); setShowHealth(value => !value); return }
+    if (event.key === 'r' && !controlsDisabled) {
+      event.preventDefault()
+      void action(async ctx => { await load(surface, ctx, undefined, surface === 'pods' && page?.captures[0]?.query.contract === 'ordinary') })
+      return
+    }
+    if (event.key === '/' && page) {
+      event.preventDefault()
+      if (loadedDetailsRef.current) loadedDetailsRef.current.open = true
+      requestAnimationFrame(() => loadedSearchRef.current?.focus())
+      return
+    }
+    const tabMap: Record<string, 'Overview' | 'Content' | 'Journey' | 'Activity' | 'Evidence'> = {
+      '1': 'Overview', '2': 'Content', '3': 'Journey', '4': 'Activity', '5': 'Evidence',
+    }
+    if (tabMap[event.key]) {
+      event.preventDefault()
+      setRequestedTab(prev => ({ tab: tabMap[event.key], seq: (prev?.seq ?? 0) + 1 }))
+    }
+  })
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => handleShortcut(event)
+    window.addEventListener('keydown', listener)
+    return () => window.removeEventListener('keydown', listener)
+  }, [])
   function saveComparison() {
     if (!comparison) return
     return action(async () => {
@@ -1068,51 +1203,112 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
   const needsReplacement = sessionEnded || freshness === 'available'
   return <main className="workspace">
     <h1 className="sr-only">Feed Lab</h1>
-    <div className="scope-bar">
-      <div className="launch">
-        <strong>{config.environment}</strong>
-        <code title={config.runtime_id} aria-label={'Launch ' + config.runtime_id}>{config.runtime_id.slice(0, 8)}</code>
-        <span className="operator-status" data-ready={operatorReady}>Operator {operatorReady ? 'signed in' : identities.operator.state === 'expired' ? 'session expired' : 'signed out'}</span>
-        <label>Consumer <select aria-label="Consumer" value={signed ? 'signed' : 'anonymous'} disabled={locked} onChange={event => {
-          reset(); setSigned(event.target.value === 'signed'); setReloadConsumerFeed(true)
-        }}><option value="anonymous">Anonymous</option><option value="signed">Signed in</option></select></label>
-        {signed && <span className="consumer-status" role="status">{needsConsumerSignIn
-          ? identities.consumer.state === 'expired' ? 'Consumer session expired' : 'Consumer sign-in required'
-          : <bdi>{identities.consumer.email || 'Consumer signed in'}</bdi>}</span>}
+    <section className="control-deck" aria-label="Session scope">
+      <div className="scope-bar">
+        <div className="launch">
+          <div className="env-cluster">
+            <strong>{config.environment}</strong>
+            <code title={config.runtime_id} aria-label={'Launch ' + config.runtime_id}>{config.runtime_id.slice(0, 8)}</code>
+          </div>
+          <span className="operator-status" data-ready={operatorReady}>Operator {operatorReady ? 'signed in' : identities.operator.state === 'expired' ? 'session expired' : 'signed out'}</span>
+          <span className="launch-divider" aria-hidden="true" />
+          <div className="consumer-control">
+            <label>Consumer <select aria-label="Consumer" value={signed ? 'signed' : 'anonymous'} disabled={locked} onChange={event => {
+              reset(); setSigned(event.target.value === 'signed'); setReloadConsumerFeed(true)
+            }}><option value="anonymous">Anonymous</option><option value="signed">Signed in</option></select></label>
+            {signed && <span className="consumer-status" data-warning={needsConsumerSignIn || undefined} role="status">{needsConsumerSignIn
+              ? identities.consumer.state === 'expired' ? 'Consumer session expired' : 'Consumer sign-in required'
+              : <bdi>{identities.consumer.email || 'Consumer signed in'}</bdi>}</span>}
+          </div>
+        </div>
+        <div className="scope-actions">
+          {page && <button type="button" className="btn-subtle" aria-expanded={showHealth} onClick={() => setShowHealth(value => !value)}>
+            <BarChart3 size={13} aria-hidden="true" />Feed health{feedAuditSummary.flags.length > 0 && <span className="tab-dot" aria-hidden="true" />}
+          </button>}
+          {signed && identities.consumer.state === 'signed-in' && <button type="button" className="btn-subtle" aria-expanded={showProfile} onClick={() => setShowProfile(value => !value)}>
+            <UserCheck size={13} aria-hidden="true" />Consumer profile
+          </button>}
+          {signed && identities.consumer.state === 'signed-in' && activeSnapshot && surface !== 'saved' && <button type="button" className="btn-subtle" disabled={controlsDisabled} onClick={() => void diffVsAnonymous()}>
+            <GitCompareArrows size={13} aria-hidden="true" />Diff vs Anonymous
+          </button>}
+          {activeSnapshot && !baseline && <button type="button" className="btn-subtle" disabled={controlsDisabled} onClick={pinBaseline}>
+            <Pin size={13} aria-hidden="true" />Pin baseline
+          </button>}
+          <button type="button" className="btn-ghost shortcuts-trigger" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)" onClick={() => setShowShortcuts(value => !value)}>
+            <Keyboard size={14} aria-hidden="true" />
+          </button>
+          <div className="switch mode-switch" role="group" aria-label="Mode">
+            <button data-mode="inspect" aria-pressed={mode === 'inspect'} disabled={locked} onClick={() => { if (mode !== 'inspect') { reset(); setMode('inspect') } }}>
+              <Eye size={13} aria-hidden="true" />Inspect
+            </button>
+            <button data-mode="test" aria-pressed={mode === 'test'} disabled={locked} onClick={() => { if (mode !== 'test') { reset(); setMode('test') } }}>
+              <FlaskConical size={13} aria-hidden="true" />Test as user
+            </button>
+          </div>
+        </div>
       </div>
-      <div className="switch" role="group" aria-label="Mode">
-        <button aria-pressed={mode === 'inspect'} disabled={locked} onClick={() => { if (mode !== 'inspect') { reset(); setMode('inspect') } }}>Inspect</button>
-        <button aria-pressed={mode === 'test'} disabled={locked} onClick={() => { if (mode !== 'test') { reset(); setMode('test') } }}>Test as user</button>
+      <SignIn config={config} identities={identities} locked={locked} busy={authenticating} onBusy={setAuthenticating}
+        promptConsumer={operatorReady && needsConsumerSignIn} onChange={finishIdentityChange} />
+    </section>
+    {showHealth && <FeedHealthPanel page={page} surface={surface} evidence={evidence}
+      canLoadMore={Boolean(page?.cursor && !(surface === 'pods' && sessionEnded) && !controlsDisabled)}
+      loadingBatch={loadingBatch} onLoadBatch={() => void loadBatchPages(5)}
+      onSelectIndex={idx => { setReader(null); setSavedMedia(null); setPosition(idx); setMobileView('preview'); phone.current?.focus() }}
+      onClose={() => setShowHealth(false)} />}
+    {showProfile && signed && identities.consumer.state === 'signed-in' && <ConsumerProfilePanel
+      scope={scope} ready={operatorReady} locked={controlsDisabled} onEvidence={append}
+      onRefreshFeed={() => void openFeed(surface)} onClose={() => setShowProfile(false)} />}
+    {showShortcuts && <div className="shortcuts-backdrop" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" onClick={() => setShowShortcuts(false)}>
+      <div className="shortcuts-modal" onClick={event => event.stopPropagation()}>
+        <div className="studio-drawer-head">
+          <h2>Keyboard shortcuts</h2>
+          <button type="button" className="btn-ghost" aria-label="Close shortcuts" onClick={() => setShowShortcuts(false)}><X size={15} aria-hidden="true" /></button>
+        </div>
+        <dl className="shortcuts-list">
+          <div><dt><kbd>J</kbd> / <kbd>K</kbd></dt><dd>Next / previous feed item</dd></div>
+          <div><dt><kbd>1</kbd>–<kbd>5</kbd></dt><dd>Switch inspector tab (Overview → Evidence)</dd></div>
+          <div><dt><kbd>H</kbd></dt><dd>Toggle Feed Health &amp; Composition audit</dd></div>
+          <div><dt><kbd>P</kbd></dt><dd>Pin or replace baseline capture</dd></div>
+          <div><dt><kbd>R</kbd></dt><dd>Refresh current feed</dd></div>
+          <div><dt><kbd>/</kbd></dt><dd>Search loaded items</dd></div>
+          <div><dt><kbd>?</kbd></dt><dd>Show or hide this shortcut reference</dd></div>
+        </dl>
       </div>
-    </div>
-    <SignIn config={config} identities={identities} locked={locked} busy={authenticating} onBusy={setAuthenticating}
-      promptConsumer={operatorReady && needsConsumerSignIn} onChange={finishIdentityChange} />
-    {problem && problem !== feedIssue?.message && <p className="problem" role="alert">{problem}</p>}
-    {notice && <p className="notice" role="status">{notice}{latestRun && <> · <Link to="/runs/$runId" params={{ runId: latestRun }}>Open run</Link></>}</p>}
+    </div>}
+    {problem && problem !== feedIssue?.message && <p className="problem" role="alert"><AlertCircle size={15} aria-hidden="true" /><span>{problem}</span></p>}
+    {notice && <p className="notice" role="status"><CheckCircle2 size={15} aria-hidden="true" /><span>{notice}{latestRun && <> · <Link to="/runs/$runId" params={{ runId: latestRun }}>Open run</Link></>}</span></p>}
     {rerunId && <section className="inspector-block rerun-panel" aria-label="Saved check settings">
       <div className="inspector-section-head"><h2>Saved check settings</h2><Link to="/" search={{}}>Close saved settings</Link></div>
       {rerun.error ? <p role="alert">{errorText(rerun.error)}</p> : !operatorReady ? <p>Sign in as operator to load the saved check.</p> :
         rerun.isPending ? <p role="status">Loading saved check…</p> : !repeatable ? <p>The saved check has no repeatable settings.</p> : <>
           <p>{rerun.data?.title} · {rerun.data?.mode === 'inspect' ? 'Inspect' : 'Test as user'}</p>
           {!matchingConsumer && <p>Switch to {rerun.data?.settings?.consumerId ? 'the consumer account used by the saved check' : 'Anonymous'} to use these settings.</p>}
-          <button type="button" disabled={locked || !matchingConsumer || !!preparedRerun} onClick={prepareRerun}>
+          <button type="button" className="primary" disabled={locked || !matchingConsumer || !!preparedRerun} onClick={prepareRerun}>
             {preparedRerun ? 'Settings ready' : 'Use saved settings'}
           </button>
         </>}
     </section>}
-    {(activeSnapshot || baseline) && <div className="comparison-tools" aria-label="Baseline controls">
-      <button type="button" disabled={controlsDisabled || !activeSnapshot} onClick={pinBaseline}>{baseline ? 'Replace baseline' : 'Pin baseline'}</button>
-      {baseline && <>
-        <span className="hint">Pinned {baseline.capture.pages[0].surface} · {new Date(baseline.capture.pages[0].at).toLocaleTimeString()}</span>
-        <button type="button" aria-expanded={showComparison} onClick={() => setShowComparison(value => !value)}>Compare baseline</button>
-        <button type="button" disabled={locked} onClick={() => { setPin(undefined); setShowComparison(false); setComparisonNote('') }}>Clear baseline</button>
-      </>}
+    {baseline && <div className="comparison-tools" aria-label="Baseline controls">
+      <div className="comparison-tools-group">
+        <button type="button" className="btn-subtle" disabled={controlsDisabled || !activeSnapshot} onClick={pinBaseline}>
+          <Pin size={13} aria-hidden="true" />Replace baseline
+        </button>
+        <span className="pinned-badge">Pinned {baseline.capture.pages[0].surface} · {new Date(baseline.capture.pages[0].at).toLocaleTimeString()}</span>
+      </div>
+      <div className="comparison-tools-group">
+        <button type="button" aria-expanded={showComparison} onClick={() => setShowComparison(value => !value)}>
+          <GitCompareArrows size={13} aria-hidden="true" />Compare baseline
+        </button>
+        <button type="button" className="btn-ghost" disabled={locked} onClick={() => { setPin(undefined); setShowComparison(false); setComparisonNote('') }}>
+          <Trash2 size={13} aria-hidden="true" />Clear baseline
+        </button>
+      </div>
     </div>}
     {baseline && showComparison && <div className="workspace-comparison">
       {comparison ? <>
         <FeedComparisonView comparison={comparison} evidence={comparisonEvidence} />
         <form className="inspector-save" onSubmit={event => { event.preventDefault(); void saveComparison() }}>
-          <label>Comparison note <textarea maxLength={2000} rows={2} value={comparisonNote} onChange={event => setComparisonNote(event.target.value)} /></label>
+          <label>Comparison note <textarea maxLength={2000} rows={2} value={comparisonNote} onChange={event => setComparisonNote(event.target.value)} placeholder="Describe what changed between captures…" /></label>
           <button className="primary" disabled={controlsDisabled}>Save comparison</button>
         </form>
       </> : <p className="hint">Load the {baseline.capture.pages[0].surface} feed in the current scope to compare it with the baseline.</p>}
@@ -1120,7 +1316,7 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
     <div className="mobile-inspector-switch" role="group" aria-label="Workspace view">
       <button aria-pressed={mobileView === 'preview'} onClick={() => setMobileView('preview')}>Preview</button>
       <button aria-pressed={mobileView === 'details'} onClick={() => setMobileView('details')}>Details</button>
-      {active && <button onClick={() => running.current?.abort()}>Stop running check</button>}
+      {active && <button className="btn-danger" onClick={() => running.current?.abort()}>Stop running check</button>}
     </div>
     <div className="workbench" data-mobile-view={mobileView}>
       <section aria-label="Consumer preview" className="preview-column">
@@ -1132,10 +1328,11 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
           <div className="switch" role="group" aria-label="Feed">
             {(['pods', 'news', 'saved'] as const).map(feed => <button key={feed} aria-pressed={surface === feed}
               disabled={controlsDisabled} onClick={() => openFeed(feed)}>
+              {feed === 'pods' ? <Headphones size={13} aria-hidden="true" /> : feed === 'news' ? <Newspaper size={13} aria-hidden="true" /> : <Bookmark size={13} aria-hidden="true" />}
               {feed === 'pods' ? 'Pods' : feed === 'news' ? 'News' : 'Saved'}
             </button>)}
           </div>
-          <span className="hint">{surface === 'pods' ? page && !page.session_id ? 'Ordinary cursor' : 'Frozen session' : surface === 'news' ? windowName : 'Bookmarks'}</span>
+          <span className="feed-contract-pill">{surface === 'pods' ? page && !page.session_id ? 'Ordinary cursor' : 'Frozen session' : surface === 'news' ? windowName : 'Bookmarks'}</span>
         </div>
         {feedIssue && <div className="feed-state" role="alert"><p>{feedIssue.feed === 'news' ? 'News' : feedIssue.feed === 'pods' ? 'Pods' : 'Saved'} request failed · {feedIssue.message}</p>
           {!feedIssue.session && <button type="button" disabled={controlsDisabled} onClick={() => retryFeed(feedIssue)}>Retry feed</button>}
@@ -1144,109 +1341,120 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
           <span role="status">{feedIssue?.session === 'stale' ? 'Stale generation' : sessionEnded ? 'Session expired' :
             freshness === 'available' ? 'New content available' : page.caughtUp || !page.cursor ? 'Caught up' : 'Frozen session active'}
             {page.expiresAt && !sessionEnded && <> · Expires {new Date(page.expiresAt).toLocaleString()}</>}</span>
-          {needsReplacement ? <button type="button" disabled={controlsDisabled} onClick={() => void openFeed('pods')}>Load new content</button> :
+          {needsReplacement ? <button type="button" className="primary" disabled={controlsDisabled} onClick={() => void openFeed('pods')}>Load new content</button> :
             <button type="button" disabled={controlsDisabled} onClick={checkFreshness}>Check freshness</button>}
           {freshness === 'current' && <small className="hint">CMS reports no new content.</small>}
         </div>}
         {surface === 'news' && !!page?.omissions.length && <p className="feed-state" role="status">{page.omissions.length} returned rows omitted by the preview. See Evidence for details.</p>}
-        <article ref={phone} aria-label="Feed card" data-preview-capture={selected?.capture?.id} data-preview-row={selected?.responseRow}
-          tabIndex={0} className={'phone phone-' + surface}
-          onKeyDown={event => {
-            if (event.target === event.currentTarget && !reader && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
-              event.preventDefault()
-              move(event.key === 'ArrowDown' ? 1 : -1)
-            }
-          }}
-          onTouchStart={event => {
-            touchStart.current = !reader && event.target instanceof Element && !event.target.closest('[data-pager-control]')
-              ? event.touches[0]?.clientY ?? null : null
-          }}
-          onTouchCancel={() => { touchStart.current = null }}
-          onTouchEnd={event => {
-            if (touchStart.current !== null && !reader && event.changedTouches[0]) {
-              const delta = touchStart.current - event.changedTouches[0].clientY
-              if (Math.abs(delta) > 55 && !canScroll(event.target, delta)) move(Math.sign(delta))
-            }
-            touchStart.current = null
-          }}
-          onWheel={event => {
-            if (!reader && Math.abs(event.deltaY) > 25 && !canScroll(event.target, event.deltaY) && performance.now() - lastSwipe.current > 350) {
-              lastSwipe.current = performance.now(); move(Math.sign(event.deltaY))
-            }
-          }}>
-          {!reader && !savedMedia && <FeedHeader key={surface} surface={surface} duration={duration} windowName={windowName}
-            disabled={controlsDisabled} onFeed={openFeed} onDuration={changeDuration} onWindow={changeWindow} />}
-          {reader ? <ArticleReader key={reader.item.id} reader={reader} disabled={locked} writesDisabled={writesDisabled}
-            onBack={backToSaved} onRead={onRead} onInteraction={onInteraction} />
-            : playingItem ? <>
-              {savedMedia && <button className="saved-back" type="button" onClick={backToSaved} disabled={locked}>Back to Saved</button>}
-              <Player key={mediaKey} item={playingItem} media={media} report={reportPlayback}
-                observed={value => { observed.current = value; setProgress(value) }}
-                disabled={locked} writesDisabled={writesDisabled}
-                display={{ audio: audioDisplay, video: videoDisplay }}
-                onDisplay={(audio, display) => {
-                  if (audio && (display === 'listen' || display === 'transcript')) setAudioDisplay(display)
-                  if (!audio && display !== 'listen') setVideoDisplay(display)
-                }}
-                onInteraction={onInteraction} readTranscript={async (id, signal) => {
-                  const result = await queryClient.fetchQuery(transcriptQuery({ scope, item: playingItem, record: append }, id, playingItem))
-                  signal.throwIfAborted()
-                  return result
-                }} />
-              </> : surface === 'news' && current ?
-                <NewsPreview key={current.id} item={current} disabled={controlsDisabled} writesDisabled={writesDisabled}
-                  onRead={onRead} onInteraction={onInteraction} />
-                : surface === 'saved' && page ? <SavedLibrary key={page.captures[0]?.id} items={page.items} index={position} scroll={savedScroll}
-                  disabled={controlsDisabled} writesDisabled={writesDisabled} filter={(page.captures[0]?.query.feed as typeof savedFilter) ?? savedFilter}
-                  sort={(page.captures[0]?.query.sort as typeof savedSort) ?? savedSort} hasMore={!!page.cursor}
-                  onFilter={filter => changeSaved(filter, savedSort)} onSort={sort => changeSaved(savedFilter, sort)} onOpen={openSaved}
-                  onRemove={item => void action(ctx => setInteraction(item, 'bookmark', false, ctx))}
-                  onMore={() => void action(async ctx => { await load('saved', ctx, page) })} />
-              : <div className="phone-empty" lang="ar" dir="rtl" data-pager-control>
-                <span>{surface === 'pods' ? 'سمعيات' : surface === 'news' ? 'الأخبار' : 'المحفوظات'}</span>
-                <p>{busy ? 'جارٍ تحميل المحتوى…' : feedIssue?.feed === surface ? 'تعذر تحميل المحتوى.' :
-                  page?.omissions.length ? 'تعذر عرض العناصر التي أعادها الموجز.' : page ? surface === 'news' ? 'لا توجد أخبار في هذه الفترة.' : 'لا يوجد محتوى لعرضه.' :
-                  !operatorReady ? 'سجّل دخول المشغّل لعرض المحتوى.' : needsConsumerSignIn ? 'سجّل دخول المستخدم لعرض المحتوى.' : 'اختر موجزًا لعرض المحتوى.'}</p>
-                {page && surface === 'news' && <div className="phone-empty-actions">
-                  {!page.omissions.length && !feedIssue && windowName !== 'month' && <button type="button" className="phone-empty-month" disabled={controlsDisabled}
-                    onClick={() => changeWindow('month')}>عرض أخبار هذا الشهر</button>}
-                  <button type="button" disabled={controlsDisabled} onClick={() => void openFeed('news')}>تحديث</button>
+        <div className="phone-stage-wrap">
+          <article ref={phone} aria-label="Feed card" data-preview-capture={selected?.capture?.id} data-preview-row={selected?.responseRow}
+            tabIndex={0} className={'phone phone-' + surface}
+            onKeyDown={event => {
+              if (event.target === event.currentTarget && !reader && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+                event.preventDefault()
+                move(event.key === 'ArrowDown' ? 1 : -1)
+              }
+            }}
+            onTouchStart={event => {
+              touchStart.current = !reader && event.target instanceof Element && !event.target.closest('[data-pager-control]')
+                ? event.touches[0]?.clientY ?? null : null
+            }}
+            onTouchCancel={() => { touchStart.current = null }}
+            onTouchEnd={event => {
+              if (touchStart.current !== null && !reader && event.changedTouches[0]) {
+                const delta = touchStart.current - event.changedTouches[0].clientY
+                if (Math.abs(delta) > 55 && !canScroll(event.target, delta)) move(Math.sign(delta))
+              }
+              touchStart.current = null
+            }}
+            onWheel={event => {
+              if (!reader && Math.abs(event.deltaY) > 25 && !canScroll(event.target, event.deltaY) && performance.now() - lastSwipe.current > 350) {
+                lastSwipe.current = performance.now(); move(Math.sign(event.deltaY))
+              }
+            }}>
+            {!reader && !savedMedia && <FeedHeader key={surface} surface={surface} duration={duration} windowName={windowName}
+              disabled={controlsDisabled} onFeed={openFeed} onDuration={changeDuration} onWindow={changeWindow} />}
+            {reader ? <ArticleReader key={reader.item.id} reader={reader} disabled={locked} writesDisabled={writesDisabled}
+              onBack={backToSaved} onRead={onRead} onInteraction={onInteraction} />
+              : playingItem ? <>
+                {savedMedia && <button className="saved-back" type="button" onClick={backToSaved} disabled={locked}>Back to Saved</button>}
+                <Player key={mediaKey} item={playingItem} media={media} report={reportPlayback}
+                  observed={value => { observed.current = value; setProgress(value) }}
+                  disabled={locked} writesDisabled={writesDisabled} forceFallback={forceFallback}
+                  display={{ audio: audioDisplay, video: videoDisplay }}
+                  onDisplay={(audio, display) => {
+                    if (audio && (display === 'listen' || display === 'transcript')) setAudioDisplay(display)
+                    if (!audio && display !== 'listen') setVideoDisplay(display)
+                  }}
+                  onInteraction={onInteraction} readTranscript={async (id, signal) => {
+                    const result = await queryClient.fetchQuery(transcriptQuery({ scope, item: playingItem, record: append }, id, playingItem))
+                    signal.throwIfAborted()
+                    return result
+                  }} />
+                </> : surface === 'news' && current ?
+                  <NewsPreview key={current.id} item={current} disabled={controlsDisabled} writesDisabled={writesDisabled}
+                    onRead={onRead} onInteraction={onInteraction} />
+                  : surface === 'saved' && page ? <SavedLibrary key={page.captures[0]?.id} items={page.items} index={position} scroll={savedScroll}
+                    disabled={controlsDisabled} writesDisabled={writesDisabled} filter={(page.captures[0]?.query.feed as typeof savedFilter) ?? savedFilter}
+                    sort={(page.captures[0]?.query.sort as typeof savedSort) ?? savedSort} hasMore={!!page.cursor}
+                    onFilter={filter => changeSaved(filter, savedSort)} onSort={sort => changeSaved(savedFilter, sort)} onOpen={openSaved}
+                    onRemove={item => void action(ctx => setInteraction(item, 'bookmark', false, ctx))}
+                    onMore={() => void action(async ctx => { await load('saved', ctx, page) })} />
+                : <div className="phone-empty" lang="ar" dir="rtl" data-pager-control>
+                  <span>{surface === 'pods' ? 'سمعيات' : surface === 'news' ? 'الأخبار' : 'المحفوظات'}</span>
+                  <p>{busy ? 'جارٍ تحميل المحتوى…' : feedIssue?.feed === surface ? 'تعذر تحميل المحتوى.' :
+                    page?.omissions.length ? 'تعذر عرض العناصر التي أعادها الموجز.' : page ? surface === 'news' ? 'لا توجد أخبار في هذه الفترة.' : 'لا يوجد محتوى لعرضه.' :
+                    !operatorReady ? 'سجّل دخول المشغّل لعرض المحتوى.' : needsConsumerSignIn ? 'سجّل دخول المستخدم لعرض المحتوى.' : 'اختر موجزًا لعرض المحتوى.'}</p>
+                  {page && surface === 'news' && <div className="phone-empty-actions">
+                    {!page.omissions.length && !feedIssue && windowName !== 'month' && <button type="button" className="phone-empty-month" disabled={controlsDisabled}
+                      onClick={() => changeWindow('month')}>عرض أخبار هذا الشهر</button>}
+                    <button type="button" disabled={controlsDisabled} onClick={() => void openFeed('news')}>تحديث</button>
+                  </div>}
                 </div>}
-              </div>}
-        </article>
+          </article>
+        </div>
         <div className="inline feed-controls">
           {surface !== 'saved' && <>
-            <button disabled={locked || !!reader || position <= 0} onClick={() => move(-1)}>Previous</button>
-            <button disabled={locked || !!reader || !page || position >= page.items.length - 1} onClick={() => move(1)}>Next item</button>
-            <button disabled={controlsDisabled || !page?.cursor || (surface === 'pods' && sessionEnded)} onClick={() => void action(async ctx => { await load(surface, ctx, page!) })}>Next page</button>
+            <button disabled={locked || !!reader || position <= 0} onClick={() => move(-1)}><ChevronLeft size={14} aria-hidden="true" />Previous</button>
+            <button disabled={locked || !!reader || !page || position >= page.items.length - 1} onClick={() => move(1)}>Next item<ChevronRight size={14} aria-hidden="true" /></button>
+            <button disabled={controlsDisabled || !page?.cursor || (surface === 'pods' && sessionEnded)} onClick={() => void action(async ctx => { await load(surface, ctx, page!) })}>Next page<ChevronsRight size={14} aria-hidden="true" /></button>
           </>}
-          <button disabled={controlsDisabled} onClick={() => void action(async ctx => { await load(surface, ctx, undefined, surface === 'pods' && page?.captures[0]?.query.contract === 'ordinary') })}>Refresh</button>
+          <button className="btn-subtle" disabled={controlsDisabled} onClick={() => void action(async ctx => { await load(surface, ctx, undefined, surface === 'pods' && page?.captures[0]?.query.contract === 'ordinary') })}><RefreshCw size={13} aria-hidden="true" />Refresh</button>
         </div>
-        {page && <details className="preview-tools">
-          <summary>Loaded items · {page.items.length}<ChevronDown size={14} /></summary>
-          <label className="loaded-search">Search loaded items <input type="search" value={loadedSearch} onChange={event => setLoadedSearch(event.target.value)} /></label>
-          <ul className="loaded-items">{loadedItems.map(({ item, index }) => <li key={item.id + '/' + index}>
-            <button type="button" disabled={locked} onClick={() => { setReader(null); setSavedMedia(null); setPosition(index); phone.current?.focus() }}>
-              <span>#{index + 1}</span> <bdi>{item.title || item.id}</bdi>{item.source_name && <small dir="auto">{item.source_name}</small>}
-            </button>
-          </li>)}</ul>
-          {!loadedItems.length && <p className="hint">No matching loaded items.</p>}
+        {page && <details ref={loadedDetailsRef} className="preview-tools">
+          <summary><span>Loaded items · {page.items.length}</span><ChevronDown size={14} className="chevron" aria-hidden="true" /></summary>
+          <div className="preview-tools-body">
+            <label className="loaded-search">Search loaded items <input ref={loadedSearchRef} type="search" value={loadedSearch} onChange={event => setLoadedSearch(event.target.value)} placeholder="Filter by title, publisher, or UUID…" /></label>
+            <ul className="loaded-items">{loadedItems.map(({ item, index }) => <li key={item.id + '/' + index}>
+              <button type="button" data-active={index === position || undefined} disabled={locked} onClick={() => { setReader(null); setSavedMedia(null); setPosition(index); phone.current?.focus() }}>
+                <span>#{index + 1}</span> <bdi>{item.title || item.id}</bdi>{item.source_name && <small dir="auto">{item.source_name}</small>}
+              </button>
+            </li>)}</ul>
+            {!loadedItems.length && <p className="hint">No matching loaded items.</p>}
+          </div>
         </details>}
         <details className="preview-tools">
-          <summary>Feed options <ChevronDown size={14} /></summary>
-          <div className="inline">
-            {surface === 'pods' && <label>Content language <select value={language} disabled={locked} onChange={e => setLanguage(e.target.value)}>
-              <option value="">Default</option><option value="ar">Arabic</option><option value="en">English</option>
-            </select></label>}
-            <button disabled={controlsDisabled} onClick={() => void action(async ctx => { await load('pods', ctx, undefined, true) })}>Ordinary Pods</button>
+          <summary><span className="summary-label"><SlidersHorizontal size={13} aria-hidden="true" /><span>Feed options</span></span><ChevronDown size={14} className="chevron" aria-hidden="true" /></summary>
+          <div className="preview-tools-body">
+            <div className="inline">
+              {surface === 'pods' && <label>Content language <select value={language} disabled={locked} onChange={e => setLanguage(e.target.value)}>
+                <option value="">Default</option><option value="ar">Arabic</option><option value="en">English</option>
+              </select></label>}
+              <button disabled={controlsDisabled} onClick={() => void action(async ctx => { await load('pods', ctx, undefined, true) })}>Ordinary Pods</button>
+              {page?.cursor && surface !== 'saved' && !(surface === 'pods' && sessionEnded) && <button type="button" className="btn-subtle" disabled={controlsDisabled || loadingBatch} onClick={() => void loadBatchPages(5)}>
+                {loadingBatch ? 'Loading…' : 'Load 5 pages'}
+              </button>}
+            </div>
+            {surface === 'pods' && <p className="hint">Refresh to apply the content language.</p>}
           </div>
-          {surface === 'pods' && <p className="hint">Refresh to apply the content language.</p>}
         </details>
       </section>
       <ItemInspector key={inspectionEpoch} scope={scope} ready={operatorReady && (!signed || identities.consumer.state === 'signed-in')}
         locked={controlsDisabled} item={selected} page={page} surface={surface} reader={reader}
         evidence={evidence} trimmed={evidenceCount > evidence.length} onEvidence={append}
         progress={progress} media={media} onSave={saveInspection} openChecks={!!preparedRerun}
+        filters={filters} forceFallback={forceFallback} onToggleFallback={() => setForceFallback(value => !value)}
+        requestedTab={requestedTab}
         onPreview={() => setMobileView('preview')}
         onVerify={(event, item) => void action(ctx => verifyRux(ctx, { ...event, item }))}
         onView={current && !reader && surface !== 'saved' ? () => {
@@ -1265,7 +1473,11 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
           await request('/preferences', selected ? withItem(ctx, selected) : ctx)
         }) : undefined}
         checks={following => <>
-          <label>Scenario <select aria-label="Scenario" value={scenario} disabled={locked || !!preparedRerun} onChange={e => setScenario(e.target.value as Scenario)}>
+          <div className="checks-header">
+            <h3>Run diagnostic checks</h3>
+            <span className="status-badge" data-tone={mode === 'test' ? 'danger' : 'info'}>{mode === 'inspect' ? 'Inspect' : 'Test as user'}</span>
+          </div>
+          <label className="scenario-select-wrap">Scenario <select aria-label="Scenario" value={scenario} disabled={locked || !!preparedRerun} onChange={e => setScenario(e.target.value as Scenario)}>
             {scenarios.map(value => <option key={value.id} value={value.id}>{value.label}</option>)}
           </select></label>
           <dl className="inspector-facts" aria-label="Check target">
@@ -1283,11 +1495,17 @@ function Lab({ config, identities, refreshIdentity, rerunId }: { config: Health;
             disabled={locked || !!preparedRerun} onChange={e => setRestore(e.target.checked)} /> Restore likes and bookmarks after the run</label>}
           <div className="inline"><button className="primary" disabled={controlsDisabled || !!checkBlock(following)} onClick={() => {
             setMobileView('preview'); void runScenario(following)
-          }}>Run scenario</button>
-          {active && <button onClick={() => running.current?.abort()}>Stop scenario</button>}</div>
-          {checkBlock(following) && <p className="hint">{checkBlock(following)}</p>}
+          }}><Play size={13} aria-hidden="true" />Run scenario</button>
+          {active && <button className="btn-danger" onClick={() => running.current?.abort()}><Square size={12} aria-hidden="true" />Stop scenario</button>}</div>
+          {checkBlock(following) && <p className="inspector-message">{checkBlock(following)}</p>}
           {checkResults.length > 0 && <ul className="check-results" aria-label="Check results">{checkResults.map((check, index) =>
-            <li key={index}><strong>{check.label}</strong> <span>{check.status}</span>{check.detail && <p className="hint">{check.detail}</p>}</li>)}</ul>}
+            <li key={index}>
+              <div className="check-result-head">
+                <strong>{check.label}</strong>
+                <span className="check-status" data-status={check.status}>{check.status}</span>
+              </div>
+              {check.detail && <p className="hint">{check.detail}</p>}
+            </li>)}</ul>}
           <EvidenceList entries={evidence.filter(entry => /^(Scenario|Assertion|Restoration)/.test(entry.label))} />
         </>} />
 

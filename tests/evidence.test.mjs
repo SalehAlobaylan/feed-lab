@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { adapt, consumption } from '../src/lib/feed.ts'
 import { feedDifferenceLabel, feedDifferences, fitRunEvidence, markdown, redact } from '../src/lib/evidence.ts'
+import { auditFeed, evaluateEligibility } from '../src/lib/feed-audit.ts'
 
 test('preview exposes invalid Pods and retains the original cursor', () => {
   const result = adapt({ cursor: 'next', items: [
@@ -69,4 +70,48 @@ test('report evidence stays bounded and marks any omitted original responses', (
   assert.equal(fit.trimmed, true)
   assert.deepEqual(fit.evidence, evidence.slice(1))
   assert.deepEqual(fit.comparison.baseline.missingResponses, ['old'])
+})
+
+test('auditFeed reports source concentration, duration buckets, duplicates, and latency', () => {
+  const capture = { id: 'cap-1', at: '2026-11-11T00:00:00Z', surface: 'pods', mode: 'inspect', consumer: 'Anonymous', query: {} }
+  const idA = '11111111-1111-4111-8111-111111111111'
+  const idB = '22222222-2222-4222-8222-222222222222'
+  const idC = '33333333-3333-4333-8333-333333333333'
+  const page = {
+    items: [
+      { id: idA, title: 'A', source_name: 'Pub 1', duration_sec: 300, playback_url: 'https://m.example/a.m3u8', playback_type: 'hls', transcript_id: 't1', parent_id: 'p1' },
+      { id: idB, title: 'B', source_name: 'Pub 1', duration_sec: 900, playback_url: 'https://m.example/b.mp4', playback_type: 'mp4', parent_id: 'p1' },
+      { id: idC, title: 'C', source_name: 'Pub 1', duration_sec: 1800, playback_url: 'https://m.example/c.mp3', playback_type: 'audio' },
+      { id: idA, title: 'A dup', source_name: 'Pub 2', duration_sec: 300, playback_url: 'https://m.example/a.m3u8', playback_type: 'hls' },
+    ],
+    caughtUp: false, captures: [capture], rows: [], omitted: [], omissions: [],
+  }
+  const evidence = [{ at: '2026-11-11T00:00:00Z', label: 'POST /feed/pods/sessions', captureId: 'cap-1', detail: { elapsed_ms: 42, response: { items: [] } } }]
+  const report = auditFeed(page, 'pods', evidence)
+  assert.equal(report.totalItems, 4)
+  assert.equal(report.publishers[0].name, 'Pub 1')
+  assert.equal(report.publishers[0].count, 3)
+  assert.deepEqual(report.duplicateIds, [3])
+  assert.equal(report.atomizedCount, 2)
+  assert.equal(report.rawCount, 2)
+  assert.equal(report.transcriptCount, 1)
+  assert.equal(report.latency.p50, 42)
+  assert.ok(report.flags.some(f => f.code === 'duplicate_identity'))
+  assert.ok(report.flags.some(f => f.code === 'source_dominance'))
+  assert.ok(report.flags.some(f => f.code === 'sibling_proximity'))
+})
+
+test('evaluateEligibility flags non-READY status, >2400s parent rule, and language mismatch', () => {
+  const gates = evaluateEligibility({
+    item: { id: '11111111-1111-4111-8111-111111111111', duration_sec: 3600, content_language: 'ar' },
+    cms: { status: 'PROCESSING', duration_sec: 3600, content_language: 'ar' },
+    summary: { item_type: 'PODS_PARENT', eligibility: { status: 'Excluded by policy', detail: 'Parent publishes via chapters' } },
+    surface: 'pods',
+    filters: { duration: '', language: 'en', windowName: 'today' },
+    isNews: false,
+  })
+  assert.equal(gates.find(g => g.id === 'status')?.status, 'fail')
+  assert.equal(gates.find(g => g.id === 'cms_eligibility')?.status, 'fail')
+  assert.equal(gates.find(g => g.id === 'duration')?.status, 'fail')
+  assert.equal(gates.find(g => g.id === 'language_filter')?.status, 'warning')
 })

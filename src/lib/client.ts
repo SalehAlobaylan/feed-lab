@@ -38,7 +38,7 @@ export async function health(): Promise<Health> {
   return config
 }
 export async function owner<T>(scope: Scope, path: string, options: {
-  method?: 'GET' | 'POST' | 'DELETE'; query?: Record<string, string>; body?: object
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; query?: Record<string, string>; body?: object
   signal?: AbortSignal; record: (entry: Evidence) => void
 }): Promise<T> {
   const method = options.method ?? 'GET'
